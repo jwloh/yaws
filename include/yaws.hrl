@@ -19,6 +19,8 @@
 -define(GC_PICK_FIRST_VIRTHOST_ON_NOMATCH,  64).
 -define(GC_USE_FDSRV,                      128).
 -define(GC_USE_OLD_SSL,                    256).
+-define(GC_USE_ERLANG_SENDFILE,            512).
+-define(GC_USE_YAWS_SENDFILE,             1024).
 
 
 -define(GC_DEF, ?GC_FAIL_ON_BIND_ERR).
@@ -37,6 +39,10 @@
         ((GC#gconf.flags band ?GC_PICK_FIRST_VIRTHOST_ON_NOMATCH) /= 0)).
 -define(gc_use_old_ssl(GC),
         ((GC#gconf.flags band ?GC_USE_OLD_SSL) /= 0)).
+-define(gc_use_erlang_sendfile(GC),
+        ((GC#gconf.flags band ?GC_USE_ERLANG_SENDFILE) /= 0)).
+-define(gc_use_yaws_sendfile(GC),
+        ((GC#gconf.flags band ?GC_USE_YAWS_SENDFILE) /= 0)).
 
 -define(gc_set_tty_trace(GC, Bool),
         GC#gconf{flags = yaws:flag(GC#gconf.flags,?GC_TTY_TRACE, Bool)}).
@@ -54,7 +60,10 @@
                                    ?GC_PICK_FIRST_VIRTHOST_ON_NOMATCH,Bool)}).
 -define(gc_set_use_old_ssl(GC, Bool),
         GC#gconf{flags = yaws:flag(GC#gconf.flags,?GC_USE_OLD_SSL,Bool)}).
-
+-define(gc_set_use_erlang_sendfile(GC, Bool),
+        GC#gconf{flags = yaws:flag(GC#gconf.flags,?GC_USE_ERLANG_SENDFILE,Bool)}).
+-define(gc_set_use_yaws_sendfile(GC, Bool),
+        GC#gconf{flags = yaws:flag(GC#gconf.flags,?GC_USE_YAWS_SENDFILE,Bool)}).
 
 
 %% global conf
@@ -64,6 +73,7 @@
           flags = ?GC_DEF,                % boolean flags
           logdir,
           ebin_dir = [],
+          src_dir  = [],
           runmods  = [],                  % runmods for entire server
           keepalive_timeout    = 30000,
           keepalive_maxuses    = nolimit, % nolimit or non negative integer
@@ -96,10 +106,11 @@
           soap_srv_mods = [],
 
           ysession_mod = yaws_session_server, % storage module for ysession
-          acceptor_pool_size = 8              % size of acceptor proc pool
+          acceptor_pool_size = 8,             % size of acceptor proc pool
+
+          mime_types_info,                    % undefined | #mime_types_info{}
+          nslookup_pref = [inet]              % [inet | inet6]
          }).
-
-
 
 -record(ssl, {
           keyfile,
@@ -110,7 +121,8 @@
           password,
           cacertfile,
           ciphers,
-          cachetimeout
+          cachetimeout,
+          secure_renegotiate = false
          }).
 
 
@@ -173,8 +185,6 @@
         SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_ADD_PORT, Bool)}).
 -define(sc_set_statistics(SC, Bool),
         SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_STATISTICS, Bool)}).
--define(sc_set_ssl(SC, Bool),
-        SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_SSL, Bool)}).
 -define(sc_set_tilde_expand(SC, Bool),
         SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_TILDE_EXPAND, Bool)}).
 -define(sc_set_dir_listings(SC, Bool),
@@ -215,10 +225,11 @@
           xtra_docroots = [],           % if we have additional pseudo docroots
           listen = [{127,0,0,1}],       % bind to this IP, {0,0,0,0} is possible
           servername = "localhost",     % servername is what Host: header is
+          serveralias = [],             % Alternate names for this vhost
           yaws,                         % server string for this vhost
           ets,                          % local store for this server
           ssl,                          % undefined | #ssl{}
-          authdirs = [],
+          authdirs = [],                % [{docroot, [#auth{}]}]
           partial_post_size = 10240,
 
           %% An item in the appmods list  can be either of the
@@ -241,13 +252,16 @@
           tilde_allowed_scripts = [],
           index_files = ["index.yaws", "index.html", "index.php"],
           revproxy = [],
-          soptions = [],
+          soptions = [{listen_opts, [{backlog, 1024}, {recbuf, 8192}]}],
           extra_cgi_vars = [],
           stats,                        % raw traffic statistics
           fcgi_app_server,              % FastCGI application server {host,port}
           php_handler = {cgi, "/usr/bin/php-cgi"},
           shaper,
-          deflate_options
+          deflate_options,              % undefined | #deflate{}
+          mime_types_info,              % undefined | #mime_types_info{}
+                                        % if undefined, global config is used
+          dispatch_mod                  % custom dispatch module
          }).
 
 
@@ -292,6 +306,16 @@
 
           %% [{Type, undefined|SubType}] | all
           mime_types = ?DEFAULT_COMPRESSIBLE_MIME_TYPES
+         }).
+
+
+%% Internal record used to set information about mime-types
+-record(mime_types_info, {
+          mime_types_file, % an absolute filename path
+          types    = [],   % a map between mime-types and extensions
+          charsets = [],   % a map between charsets and extensions
+          default_type = "text/plain",
+          default_charset
          }).
 
 
@@ -343,6 +367,7 @@
           content_encoding,
           transfer_encoding,
           www_authenticate,
+          vary,
           other                % misc other headers
          }).
 
@@ -353,7 +378,6 @@
           url,
           intercept_mod
          }).
-
 
 
 %% as read by application:get_env()

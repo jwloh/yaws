@@ -12,15 +12,11 @@ else
 	PRIV_FILES= ../priv/lib/setuid_drv.$(DLL)  $(EPAM)
 endif
 
-ifeq ($(HAVE_YAWS_SENDFILE),true)
+ifeq ($(HAVE_SENDFILE),true)
 	PRIV_FILES += ../priv/lib/yaws_sendfile_drv.$(DLL)
 endif
 
-
 CFLAGS += -I"${ERLDIR}/usr/include"
-
-# and for MacOs + possibly others ...
-CFLAGS += -I/usr/include/pam/ $(EXTRAINCLUDE)
 
 #
 # Targets
@@ -47,12 +43,12 @@ endif
 ../priv/lib/setuid_drv.$(DLL): setuid_drv.$(OBJ)
 	$(LD_SHARED) $(OUT) $@ $< $(DLL_LIBS)
 setuid_drv.$(OBJ):	setuid_drv.c
-	$(CC) -c $(FPIC) $(CFLAGS) -DDYNAMIC_DRIVER $<
+	$(CC) -c $(FPIC) $(CFLAGS) $<
 
 ../priv/lib/yaws_sendfile_drv.$(DLL): yaws_sendfile_drv.$(OBJ) hashtable.$(OBJ)
 	$(LD_SHARED) $(OUT) $@ $^ $(DLL_LIBS)
 yaws_sendfile_drv.$(OBJ):	yaws_sendfile_drv.c
-	$(CC) -c $(FPIC) $(CFLAGS) -DDYNAMIC_DRIVER $<
+	$(CC) -c $(FPIC) $(CFLAGS) $<
 hashtable.$(OBJ):	hashtable.c
 	$(CC) -c $(FPIC) $(CFLAGS) $<
 

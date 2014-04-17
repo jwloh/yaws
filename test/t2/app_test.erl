@@ -1,6 +1,6 @@
 -module(app_test).
 -include("../include/tftest.hrl").
--include("../ibrowse/include/ibrowse.hrl").
+-include_lib("ibrowse/include/ibrowse.hrl").
 -compile(export_all).
 
 
@@ -13,26 +13,35 @@ start([F]) ->
 start() ->
     io:format("\n ==== MAIN TESTS ==== \n\n", []),
     ?line {ok, _} = ibrowse:start_link(),
-    server_options_test(),
+    test_server_options(),
     test1(),
     test2(),
     test3(),
-    appmod_test(),
-    streamcontent_test(),
+    test_appmod(),
+    test_dispatchmod(),
+    test_streamcontent(),
     sendfile_get(),
-    json_test(),
-    post_test(),
-    flush_test(),
-    expires_test(),
-    reentrant_test(),
-    cgi_redirect_test(),
-    php_handler_test(),
-    arg_rewrite_test(),
-    shaper_test(),
-    sslaccept_timeout_test(),
-    throw_test(),
-    too_many_headers_test(),
-    index_files_test(),
+    test_json(),
+    test_post(),
+    test_flush(),
+    test_te_trailer_and_extensions(),
+    test_expires(),
+    test_reentrant(),
+    test_cgi_redirect(),
+    test_php_handler(),
+    test_arg_rewrite(),
+    test_shaper(),
+    test_sslaccept_timeout(),
+    test_ssl_multipart_post(),
+    test_throw(),
+    test_too_many_headers(),
+    test_index_files(),
+    test_embedded_id_dir(),
+    test_embedded_listen_ip(),
+    test_chained_appmods(),
+    test_cache_appmod(),
+    test_multi_forwarded_for(),
+    test_log_rotation(),
     ibrowse:stop().
 
 
@@ -104,9 +113,7 @@ read_loop(C, I, Sz)  ->
 get_cont_len(C) ->
     ?line {value, {http_header, _,_,_, LenStr}} =
 	lists:keysearch('Content-Length', 3, tftest:get_headers(C)),
-    {ok, list_to_integer(LenStr)}.
-
-
+    {ok, erlang:list_to_integer(LenStr)}.
 
 
 test2() ->
@@ -136,7 +143,7 @@ test3() ->
                                                        [], head),
     ok.
 
-server_options_test() ->
+test_server_options() ->
     io:format("server_options_test\n",[]),
     {ok, S} = gen_tcp:connect("localhost", 8000, [{packet, raw}, list,
                                                   {active, false}]),
@@ -226,7 +233,7 @@ collect(L, Count, Tag) ->
 
 -define(APPMOD_HEADER, "Appmod-Called").
 
-appmod_test() ->
+test_appmod() ->
     io:format("appmod_test\n",[]),
     Uri1 = "http://localhost:8002/",
     ?line {ok, "200", Headers1, _} = ibrowse:send_req(Uri1, [], get),
@@ -242,7 +249,19 @@ appmod_test() ->
     ?line "true" = proplists:get_value(?APPMOD_HEADER, Headers4),
     ok.
 
-streamcontent_test() ->
+test_dispatchmod() ->
+    io:format("dispatchmod test\n", []),
+    Uri1 = "http://localhost:8011/done",
+    ?line {ok, "204", Headers1, _} = ibrowse:send_req(Uri1, [], get),
+    ?line "true" = proplists:get_value("X-DispatchMod", Headers1),
+    Uri2 = "http://localhost:8011/closed",
+    ?line {ok, "200", Headers2, _} = ibrowse:send_req(Uri2, [], get),
+    ?line "close" = proplists:get_value("Connection", Headers2),
+    Uri3 = "http://localhost:8011/index.yaws",
+    ?line {ok, "200", _, _} = ibrowse:send_req(Uri3, [], get),
+    ok.
+
+test_streamcontent() ->
     io:format("streamcontent_test\n",[]),
     Uri1 = "http://localhost:8000/streamtest/1",
     ?line {ok, "200", Headers1, Body1} = ibrowse:send_req(Uri1, [], get),
@@ -281,7 +300,7 @@ streamcontent_test() ->
 
 -define(JSON_URI, "http://localhost:8005/jsontest").
 
-json_test() ->
+test_json() ->
     io:format("json_test\n",[]),
     io:format("  param array1\n", []),
     ?line ok = do_json({struct, [{"jsonrpc", "2.0"},
@@ -515,7 +534,7 @@ recv_hdrs(Sock, Len) ->
         {http, Sock, {http_error, Error}} ->
             {error, Error};
         {http, Sock, {http_header, _, 'Content-Length', _, LenStr}} ->
-            recv_hdrs(Sock, list_to_integer(LenStr));
+            recv_hdrs(Sock, erlang:list_to_integer(LenStr));
         {http, Sock, {http_header, _, _, _, _}} ->
             recv_hdrs(Sock, Len);
         {http, Sock, {http_response, _, 200, "OK"}} ->
@@ -526,7 +545,7 @@ recv_hdrs(Sock, Len) ->
 
 
 %% partial_post_size = 2048000
-post_test() ->
+test_post() ->
     io:format("post_test\n",[]),
     small_post(),
     large_post(),
@@ -538,7 +557,7 @@ small_post() ->
     io:format("  small post\n",[]),
     {ok, Bin} = file:read_file("../../www/1000.txt"),
     Sz = size(Bin),
-    Uri = "http://localhost:8006/posttest/" ++ integer_to_list(Sz),
+    Uri = "http://localhost:8006/posttest/" ++ erlang:integer_to_list(Sz),
     Hdrs = [{content_length, Sz}, {content_type, "binary/octet-stream"}],
     ?line {ok, "200", _, _} = ibrowse:send_req(Uri, Hdrs, post, Bin, []),
     ok.
@@ -547,7 +566,7 @@ large_post() ->
     io:format("  large post\n",[]),
     {ok, Bin} = file:read_file("../../www/10000.txt"),
     Sz = size(Bin),
-    Uri = "http://localhost:8006/posttest/" ++ integer_to_list(Sz),
+    Uri = "http://localhost:8006/posttest/" ++ erlang:integer_to_list(Sz),
     Hdrs = [{content_length, Sz}, {content_type, "binary/octet-stream"}],
     ?line {ok, "200", _, _} = ibrowse:send_req(Uri, Hdrs, post, Bin, []),
     ok.
@@ -556,7 +575,7 @@ small_chunked_post() ->
     io:format("  small chunked post\n",[]),
     {ok, Bin} = file:read_file("../../www/3000.txt"),
     Sz = size(Bin),
-    Uri = "http://localhost:8006/posttest/chunked/" ++ integer_to_list(Sz),
+    Uri = "http://localhost:8006/posttest/chunked/" ++ erlang:integer_to_list(Sz),
     Hdrs = [{content_type, "binary/octet-stream"}],
     Opts = [{transfer_encoding, {chunked, 1000*1000}}],
     ?line {ok, "200", _, _} = ibrowse:send_req(Uri, Hdrs, post, Bin, Opts),
@@ -566,7 +585,7 @@ large_chunked_post() ->
     io:format("  large chunked post\n",[]),
     {ok, Bin} = file:read_file("../../www/10000.txt"),
     Sz = size(Bin),
-    Uri = "http://localhost:8006/posttest/chunked/" ++ integer_to_list(Sz),
+    Uri = "http://localhost:8006/posttest/chunked/" ++ erlang:integer_to_list(Sz),
     Hdrs = [{content_type, "binary/octet-stream"}],
 
     %% size of chunk _IS_NOT_ a multiple of partial_post_size
@@ -578,7 +597,7 @@ large_chunked_post() ->
     ?line {ok, "200", _, _} = ibrowse:send_req(Uri, Hdrs, post, Bin, Opts2),
     ok.
 
-flush_test() ->
+test_flush() ->
     io:format("flush_test\n",[]),
     flush_small_post(),
     flush_large_post(),
@@ -592,7 +611,7 @@ flush_small_post() ->
     io:format("  flush small post\n",[]),
     {ok, Bin} = file:read_file("../../www/1000.txt"),
     Sz = size(Bin),
-    Uri1 = "http://localhost:8006/flushtest/" ++ integer_to_list(Sz),
+    Uri1 = "http://localhost:8006/flushtest/" ++ erlang:integer_to_list(Sz),
     Uri2 = "http://localhost:8006/hello.txt",
     Hdrs = [{content_length, Sz}, {content_type, "binary/octet-stream"}],
     {ok, ConnPid} = ibrowse:spawn_worker_process("localhost", 8006),
@@ -605,7 +624,7 @@ flush_large_post() ->
     io:format("  flush large post\n",[]),
     {ok, Bin} = file:read_file("../../www/10000.txt"),
     Sz = size(Bin),
-    Uri1 = "http://localhost:8006/flushtest/" ++ integer_to_list(Sz),
+    Uri1 = "http://localhost:8006/flushtest/" ++ erlang:integer_to_list(Sz),
     Uri2 = "http://localhost:8006/hello.txt",
     Hdrs = [{content_length, Sz}, {content_type, "binary/octet-stream"}],
     {ok, ConnPid} = ibrowse:spawn_worker_process("localhost", 8006),
@@ -618,7 +637,7 @@ flush_chunked_post() ->
     io:format("  flush chunked post\n",[]),
     {ok, Bin} = file:read_file("../../www/10000.txt"),
     Sz = size(Bin),
-    Uri1 = "http://localhost:8006/flushtest/chunked/" ++ integer_to_list(Sz),
+    Uri1 = "http://localhost:8006/flushtest/chunked/" ++ erlang:integer_to_list(Sz),
     Uri2 = "http://localhost:8006/hello.txt",
     Hdrs = [{content_type, "binary/octet-stream"}],
     Opts = [{transfer_encoding, {chunked, 4000*1000}}],
@@ -664,15 +683,38 @@ flush_chunked_get() ->
     ibrowse:stop_worker_process(ConnPid),
     ok.
 
+test_te_trailer_and_extensions() ->
+    io:format("te_trailer_and_extensions_test\n",[]),
+    {ok, Sock} = gen_tcp:connect("localhost", 8006, [binary, {active, false}]),
+    Data = ["This is the data in the first chunk\n",
+            "and this is the second one\n",
+            "con", "sequence"],
+    Path = "/posttest/chunked/" ++ erlang:integer_to_list(length(lists:flatten(Data))),
+    ?line gen_tcp:send(Sock, "POST "++Path++" HTTP/1.1\r\n"
+                       "Host: localhost\r\n"
+                       "Trailer: Content-Type\r\n"
+                       "Trailer: Extra-Headers-WooHoo\r\n"
+                       "Transfer-Encoding: Chunked\r\n\r\n"),
+    Body = lists:flatten([[erlang:integer_to_list(length(X), 16),"; foo=bar\r\n",
+                           X,"\r\n"] || X <- Data]),
+    ?line gen_tcp:send(Sock, Body),
+    ?line gen_tcp:send(Sock, "0\r\n"
+                       "Extra-Headers-WooHoo: something\r\n"
+                       "Content-Type: text/plain\r\n\r\n"),
+    inet:setopts(Sock, [{packet, http}]),
+    ?line {ok, _Len} = recv_hdrs(Sock),
+    gen_tcp:close(Sock),
+    ok.
 
-expires_test() ->
+
+test_expires() ->
     io:format("expires_test\n", []),
     Uri = "http://localhost:8006/hello.txt",
     ?line {ok, "200", Hdrs, _} = ibrowse:send_req(Uri, [], get),
 
     %% Retrieve max-age value to test Expires header
     ?line "max-age=" ++ Rest = proplists:get_value("Cache-Control", Hdrs),
-    ?line Secs = list_to_integer(Rest),
+    ?line Secs = erlang:list_to_integer(Rest),
 
     %% Convert Date and Expires into datetime()
     ?line Date = proplists:get_value("Date", Hdrs),
@@ -687,7 +729,7 @@ expires_test() ->
     ok.
 
 
-reentrant_test() ->
+test_reentrant() ->
     io:format("reentrant_test\n", []),
     reentrant_test_status(),
     reentrant_test_delayed_headers(),
@@ -708,14 +750,14 @@ reentrant_test_delayed_headers() ->
     ?line "true" = proplists:get_value("X-Delayed-Header", Hdrs),
     ok.
 
-cgi_redirect_test() ->
+test_cgi_redirect() ->
     io:format("cgi_redirect_test\n", []),
     Uri = "http://localhost:8008/cgi-bin/redirect_test.cgi",
     ?line {ok, "302", Hdrs, _} = ibrowse:send_req(Uri, [], get),
     ?line true = lists:any(fun({"Location", _}) -> true; (_) -> false end, Hdrs),
     ok.
 
-php_handler_test() ->
+test_php_handler() ->
     io:format("php_handler_test\n", []),
     Uri = "http://localhost:8006/test.php",
     {ok, Binary} = file:read_file("./www/test.php"),
@@ -723,7 +765,7 @@ php_handler_test() ->
     ?line {ok, "200", _, Content} = ibrowse:send_req(Uri, [], get),
     ok.
 
-arg_rewrite_test() ->
+test_arg_rewrite() ->
     io:format("arg_rewrite_test\n", []),
     arg_rewrite_test_rewrite(),
     arg_rewrite_test_redirect(),
@@ -734,7 +776,7 @@ arg_rewrite_test_rewrite() ->
     io:format("  rewrite\n", []),
     Uri = "http://localhost:8006/rewrite",
     ?line {ok, "200", Hdrs, _} = ibrowse:send_req(Uri, [], get),
-    ?line "text/plain" = proplists:get_value("Content-Type", Hdrs),
+    ?line "text/plain" = split_content_type(Hdrs),
     {ok, FI} = file:read_file_info("./www/hello.txt"),
     Etag = yaws:make_etag(FI),
     ?line Etag = proplists:get_value("Etag", Hdrs),
@@ -752,13 +794,15 @@ arg_rewrite_test_response() ->
     io:format("  response\n", []),
     Uri = "http://localhost:8006/response",
     ?line {ok, "200", Hdrs, Content} = ibrowse:send_req(Uri, [], get),
-    ?line "text/plain" = proplists:get_value("Content-Type", Hdrs),
+    ?line "text/plain" = split_content_type(Hdrs),
     ?line "Goodbye, Cruel World!" = Content,
     ok.
 
+%% split content type away from any charset info
+split_content_type(Hdrs) ->
+    hd(string:tokens(proplists:get_value("Content-Type", Hdrs), " ;")).
 
-
-shaper_test() ->
+test_shaper() ->
     io:format("shaper_test\n", []),
     Uri = "http://localhost:8007/",
     ?line {ok, "200", _, _} = ibrowse:send_req(Uri, [], get),
@@ -769,26 +813,55 @@ shaper_test() ->
 
 
 
-sslaccept_timeout_test() ->
-    io:format("sslaccept_tout_test\n", []),
-    {ok, Sock} = gen_tcp:connect("localhost", 8443, [binary, {active, true}]),
-    ?line ok = receive
-                   {tcp_closed, Sock} -> ok
-               after
-                   %% keepalive_timeout is set to 10 secs. So, wait 15 secs
-                   %% before returning an error
-                   15000 -> error
-               end,
-    gen_tcp:close(Sock),
+test_sslaccept_timeout() ->
+    case erlang:system_info(version) of
+        "5.9.3" ->
+            io:format("sslaccept_tout_test (skipping due to R15B03 bug)\n", []);
+        _ ->
+            io:format("sslaccept_tout_test\n", []),
+            {ok, Sock} = gen_tcp:connect("localhost", 8443, [binary, {active, true}]),
+            ?line ok = receive
+                           {tcp_closed, Sock} -> ok
+                       after
+                           %% keepalive_timeout is set to 10 secs. So, wait 15 secs
+                           %% before returning an error
+                           15000 -> error
+                       end,
+            gen_tcp:close(Sock)
+    end,
     ok.
 
-throw_test() ->
+test_ssl_multipart_post() ->
+    io:format("ssl_multipart_post_test\n", []),
+    ok = application:start(crypto),
+    ok = application:start(asn1),
+    ok = application:start(public_key),
+    ok = application:start(ssl),
+    Boundary = "----------------------------3e9876546ecf\r\n",
+    {ok, Bin0} = file:read_file("../../www/1000.txt"),
+    Data = list_to_binary([Boundary, Bin0]),
+    Size = size(Data),
+    Headers = [
+               {'Content-Type', "multipart/form-data; Boundary=" ++ Boundary},
+               {'Content-Length', Size}
+              ],
+    Uri = "https://localhost:8444/test_upload_ssl.yaws",
+    Options = [{is_ssl, true}, {ssl_options, [{verify, 0}]}],
+    ?line {ok, "200", _, _} = ibrowse:send_req(Uri, Headers, post, Data, Options),
+    ok = application:stop(ssl),
+    ok = application:stop(public_key),
+    ok = application:stop(asn1),
+    ok = application:stop(crypto),
+    ok.
+
+
+test_throw() ->
     io:format("throw test\n", []),
     Uri = "http://localhost:8009/",
     ?line {ok, "500", _, _} = ibrowse:send_req(Uri, [], get),
     ok.
 
-too_many_headers_test() ->
+test_too_many_headers() ->
     io:format("too many request headers test\n", []),
     Uri = "http://localhost:8009/",
     Hdrs = [{link, "<compact.css>; rel=\"stylesheet\"; title=\"compact\""} || _ <- lists:seq(0, 1001)],
@@ -796,13 +869,14 @@ too_many_headers_test() ->
     ok.
 
 
-index_files_test() ->
+test_index_files() ->
     io:format("index_files test\n", []),
+    ?line {ok, Bin} = file:read_file("../../www/testdir/index.html"),
+    Content = binary_to_list(Bin),
+
     %% "/" should be redirected to "/testdir", then to "/testdir/" and finally
     %% get "/testdir/index.html"
     Uri0 = "http://localhost:8010/",
-    ?line {ok, Bin} = file:read_file("../../www/testdir/index.html"),
-    Content = binary_to_list(Bin),
     ?line {ok, "302", Hdrs1, _} = ibrowse:send_req(Uri0, [], get),
     ?line Uri1 = proplists:get_value("Location", Hdrs1),
     ?line "http://localhost:8010/testdir" = Uri1,
@@ -810,6 +884,134 @@ index_files_test() ->
     ?line Uri2 = proplists:get_value("Location", Hdrs2),
     ?line "http://localhost:8010/testdir/" = Uri2,
     ?line {ok, "200", _, Content} = ibrowse:send_req(Uri2, [], get),
+
+    %% Do the same thing but with a query-string
+    Uri3 = "http://localhost:8010/?a=1&b=2",
+    ?line {ok, "302", Hdrs3, _} = ibrowse:send_req(Uri3, [], get),
+    ?line Uri4 = proplists:get_value("Location", Hdrs3),
+    ?line "http://localhost:8010/testdir?a=1&b=2" = Uri4,
+    ?line {ok, "302", Hdrs4, _} = ibrowse:send_req(Uri4, [], get),
+    ?line Uri5 = proplists:get_value("Location", Hdrs4),
+    ?line "http://localhost:8010/testdir/?a=1&b=2" = Uri5,
+    ?line {ok, "200", _, Content} = ibrowse:send_req(Uri5, [], get),
+    ok.
+
+
+test_embedded_id_dir() ->
+    io:format("test_embedded_id_dir\n", []),
+    Id = "id_dir_test",
+    GconfList = [{id, Id},
+                 {logdir, "./logs"},
+                 {ebin_dir, ["./ebin"]}],
+    Docroot = yaws:tmpdir(),
+    SconfList = [{port, 9999},
+                 {servername, Id},
+                 {listen, {127,0,0,1}},
+                 {docroot, Docroot}],
+    {ok, _SCList, _GC, _ChildSpecs} = yaws_api:embedded_start_conf(
+                                        Docroot, SconfList, GconfList, Id),
+    try
+        {ok,
+         {file_info, _, directory, read_write, _, _, _, _, _, _, _, _, _, _}} =
+            file:read_file_info(yaws:id_dir(Id)),
+        ok
+    after
+        ok = file:del_dir(yaws:id_dir(Id))
+    end.
+
+test_embedded_listen_ip() ->
+    %% make sure we can specify a listen address as either
+    %% a list or a tuple
+    lists:map(fun(IP) ->
+		      DocRoot = ".",
+		      Id = "embedded_listen",
+		      SConf = [{servername, "embedded_listen:8000"},
+			       {docroot, DocRoot},
+			       {listen, IP},
+			       {port, 0},
+			       {appmods,[{"/", ?MODULE}]}],
+		      GConf = [{id, Id}],
+		      ok = yaws:start_embedded(DocRoot, SConf, GConf, Id),
+		      yaws:stop()
+	      end, [{0,0,0,0}, "0.0.0.0"]).
+
+test_chained_appmods() ->
+    io:format("test_chained_appmods\n", []),
+    {ok, Bin} = file:read_file("../../www/1000.txt"),
+    Content = binary_to_list(Bin),
+    Uri = "http://localhost:8012/",
+    ?line {ok, "200", Hdrs, Content} = ibrowse:send_req(Uri, [], get),
+    ?line "appmod1[/], appmod2[/appmod2], appmod1[/appmod1], appmod3[/1000.txt]" =
+        proplists:get_value("X-AppMods", Hdrs),
+    ok.
+
+test_cache_appmod() ->
+    io:format("test_cache_appmod\n", []),
+    Uri1 = "http://localhost:8013/index.yaws?no-cache=1",
+    Uri2 = "http://localhost:8013/index.yaws",
+
+    %% call cache_appmod_test and disable page cache
+    ?line {ok, "200", Hdrs1, _} = ibrowse:send_req(Uri1, [], get),
+    ?line "cache_appmod_test" = proplists:get_value("X-Appmod", Hdrs1),
+
+    %% check that index.yaws is not cached
+    ?line {ok, "200", Hdrs2, _} = ibrowse:send_req(Uri2, [], get),
+    ?line "cache_appmod_test" = proplists:get_value("X-Appmod", Hdrs2),
+
+    %% retrieve index.yaws from the cache, so cache_appmod_test is not called
+    ?line {ok, "200", Hdrs3, _} = ibrowse:send_req(Uri2, [], get),
+    ?line undefined = proplists:get_value("X-Appmod", Hdrs3),
+
+    ok.
+
+test_multi_forwarded_for() ->
+    io:format("test_multi_forwarded_for\n", []),
+    %% apparently ibrowse can't handle sending two separate headers with
+    %% the same name but different values, which is needed for this test
+    ?line {ok, S} = gen_tcp:connect(localhost, 8014, [{active,false},
+                                                      {packet,http}]),
+    ok = gen_tcp:send(S, ["GET / HTTP/1.1\r\nHost: localhost\r\n"
+                          "X-Forwarded-For: 192.168.1.1\r\n",
+                          "X-Forwarded-For: 192.168.1.2\r\n\r\n"]),
+    ?line ok = check_forwarded_for(S),
+    ok.
+
+check_forwarded_for(S) ->
+    inet:setopts(S, [{active,once}]),
+    receive
+        {http, S, {http_response, _, Code, _}} ->
+            gen_tcp:close(S),
+            case Code of
+                200 ->
+                    ok;
+                _ ->
+                    Code
+            end
+    end.
+
+test_log_rotation() ->
+    io:format("test_log_rotation\n", []),
+    %% Write 1M of data in .access and .auth log to check the log rotation
+    ?line {ok, Fd1} = file:open("./logs/localhost:8000.access", [write]),
+    ?line ok = file:write(Fd1, lists:duplicate(1000001, $a)),
+    file:close(Fd1),
+    file:sync(Fd1),
+
+    ?line {ok, Fd2} = file:open("./logs/localhost:8000.auth", [write]),
+    ?line ok = file:write(Fd2, lists:duplicate(1000001, $a)),
+    file:close(Fd2),
+    file:sync(Fd2),
+
+    ?line {ok, "200", _, _} =
+        ibrowse:send_req("http://localhost:8000/wrap_log", [], get),
+
+    timer:sleep(500),
+
+    ?line {ok, _} = file:read_file_info("./logs/localhost:8000.access.old"),
+    ?line {ok, _} = file:read_file_info("./logs/localhost:8000.auth.old"),
+    ?line {ok, _} = file:read_file_info("./logs/localhost:8000.access"),
+    ?line {ok, _} = file:read_file_info("./logs/localhost:8000.auth"),
+
     ok.
 
 %% used for appmod tests

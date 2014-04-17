@@ -29,6 +29,7 @@
          getconf/0,
          stats/0,
          gs_status/0,
+         listen_port/1,
          ssi/3,ssi/5,ssi/6,
 	 conn_read_error/4
         ]).
@@ -39,6 +40,9 @@
          setup_dirs/1,
          deliver_dyn_part/8, finish_up_dyn_file/2, gserv_loop/4
         ]).
+
+%% exports for eunit usage
+-export([comp_sname/2, wildcomp_salias/2]).
 
 -export(['GET'/4,
          'POST'/4,
@@ -60,7 +64,7 @@
              certinfo,      %% undefined | #certinfo{}
              l,             %% listen socket
              mnum = 0,
- 	     connections = 0, %% number of TCP connections opened now
+             connections = 0, %% number of TCP connections opened now
              sessions = 0,  %% number of active HTTP sessions
              reqs = 0}).    %% total number of processed HTTP requests
 
@@ -95,6 +99,32 @@ gs_status() ->
       end, Pids).
 getconf() ->
     gen_server:call(?MODULE,getconf, infinity).
+
+%% Return the configured port number from the sconf or, if the port number
+%% is 0 indicating an ephemeral port, retrieve the actual port via sockname
+listen_port(#sconf{}=SC) ->
+    try
+        lists:foldl(fun(#gs{group=SCs, l=Sock}, Acc) ->
+                            case lists:member(SC, SCs) of
+                                true ->
+                                    {ok, {_, Port}} =
+                                        case SC#sconf.ssl of
+                                            undefined ->
+                                                inet:sockname(Sock);
+                                            _ ->
+                                                ssl:sockname(Sock)
+                                        end,
+                                    %% throw the result to end the fold early
+                                    throw(Port);
+                                false ->
+                                    Acc
+                            end
+                    end, [], gs_status()),
+        {error, not_found}
+    catch
+        throw:Port ->
+            Port
+    end.
 
 stats() ->
     {_S, Time} = status(),
@@ -171,6 +201,7 @@ init(Env) -> %% #env{Trace, TraceOut, Conf, RunMod, Embedded, Id}) ->
 
 init2(GC, Sconfs, RunMod, Embedded, FirstTime) ->
     put(gc, GC),
+    yaws_sendfile:check_gc_flags(GC),
     case GC#gconf.mnesia_dir of
         MD when length(MD) > 0 ->
             yaws_debug:format("loading mnesia ~p~n", [MD]),
@@ -179,11 +210,10 @@ init2(GC, Sconfs, RunMod, Embedded, FirstTime) ->
         _ ->
             ok
     end,
-    foreach(
-      fun(D) ->
-              yaws_debug:format("Add path ~p~n", [D]),
-              code:add_pathz(D)
-      end, GC#gconf.ebin_dir),
+    foreach(fun(D) ->
+                    yaws_debug:format("Add path ~p~n", [D]),
+                    code:add_pathz(D)
+            end, GC#gconf.ebin_dir),
     yaws_debug:format("Running with id=~p (localinstall=~p) ~n"
                       "~s"
                       "Logging to directory ~p~n",
@@ -214,13 +244,12 @@ init2(GC, Sconfs, RunMod, Embedded, FirstTime) ->
     end,
 
     runmod(RunMod, GC),
-
-    L2 = lists:zf(
-           fun(Group) -> start_group(GC, Group) end,
-           Sconfs),
-    {ok, #state{gc = GC,
-                pairs = L2,
-                mnum = 0,
+    yaws_config:compile_and_load_src_dir(GC),
+    L2 = lists:zf(fun(Group) -> start_group(GC, Group) end,
+                  yaws_config:load_mime_types_module(GC, Sconfs)),
+    {ok, #state{gc       = GC,
+                pairs    = L2,
+                mnum     = 0,
                 embedded = Embedded}}.
 
 
@@ -299,19 +328,20 @@ handle_call(check_certs, _From, State) ->
                   end, State#state.pairs),
     {reply, L, State};
 
-handle_call({update_sconf, NewSc}, From, State) ->
+handle_call({update_sconf, Pos, NewSc}, From, State) ->
     case yaws_config:search_sconf(NewSc, State#state.pairs) of
-        {Pid, OldSc, _Group} ->
-            case yaws_config:eq_sconfs(OldSc,NewSc) of
+        {Pid, OldSc, Group} ->
+            OldPos = string:str(Group, [OldSc]),
+            case (yaws_config:eq_sconfs(OldSc,NewSc) andalso OldPos == Pos) of
                 true ->
                     error_logger:info_msg("Keeping conf for ~s intact\n",
                                           [yaws:sconf_to_srvstr(OldSc)]),
-                    {reply, ok, State};
+                    {reply, ok,  State};
                 false ->
-                    Pid ! {update_sconf, NewSc, OldSc, From, self()},
+                    Pid ! {update_sconf, Pos, NewSc, OldSc, From, self()},
                     receive
                         {updated_sconf, Pid, NewSc2} ->
-                            P2 = yaws_config:update_sconf(NewSc2,
+                            P2 = yaws_config:update_sconf(NewSc2, Pos,
                                                           State#state.pairs),
                             {noreply, State#state{pairs = P2}}
                     after 2000 ->
@@ -323,8 +353,8 @@ handle_call({update_sconf, NewSc}, From, State) ->
     end;
 
 
-handle_call({delete_sconf, SC}, From, State) ->
-    case yaws_config:search_sconf(SC, State#state.pairs) of
+handle_call({delete_sconf, Sc}, From, State) ->
+    case yaws_config:search_sconf(Sc, State#state.pairs) of
         {Pid, OldSc, Group} when length(Group) == 1 ->
             error_logger:info_msg("Terminate whole ~s virt server group \n",
                                   [yaws:sconf_to_srvstr(OldSc)]),
@@ -339,24 +369,24 @@ handle_call({delete_sconf, SC}, From, State) ->
             {reply, {error, "No matching group"}, State}
     end;
 
-handle_call({add_sconf, SC}, From, State) ->
-    case yaws_config:search_group(SC, State#state.pairs) of
-        [{Pid, Group}] ->
-            Pid ! {add_sconf, From, SC, self()},
-	    receive
-		{added_sconf, Pid, SC2} ->
-		    P2 = lists:keyreplace(Pid, 1, State#state.pairs,
-					  {Pid, Group ++ [SC2]}),
-		    {noreply, State#state{pairs = P2}}
-	    after 2000 ->
-		    {reply, {error, "Failed to add new conf"}, State}
-	    end;
+handle_call({add_sconf, Pos, Sc}, From, State) ->
+    case yaws_config:search_group(Sc, State#state.pairs) of
+        [{Pid, _Group}] ->
+            Pid ! {add_sconf, From, Pos, Sc, self()},
+            receive
+                {added_sconf, Pid, Sc2} ->
+                    P2 = yaws_config:update_sconf(Sc2, Pos,
+                                                  State#state.pairs),
+                    {noreply, State#state{pairs = P2}}
+            after 2000 ->
+                    {reply, {error, "Failed to add new conf"}, State}
+            end;
         [] ->
             %% Need to create a new group
             error_logger:info_msg("Creating new virt server ~s\n",
-                                  [yaws:sconf_to_srvstr(SC)]),
+                                  [yaws:sconf_to_srvstr(Sc)]),
             GC = State#state.gc,
-            case start_group(GC, [SC]) of
+            case start_group(GC, [Sc]) of
                 false ->
                     {reply, ok, State};
                 {true, Pair} ->
@@ -425,7 +455,7 @@ do_listen(GC, SC) ->
             {nossl, undefined, gen_tcp_listen(SC#sconf.port, listen_opts(GC, SC))};
         SSL ->
             {ssl, certinfo(SSL),
-             ssl:listen(SC#sconf.port, ssl_listen_opts(GC, SC, SSL))}
+             ssl_listen(SC#sconf.port, ssl_listen_opts(GC, SC, SSL))}
     end.
 
 certinfo(SSL) ->
@@ -463,9 +493,12 @@ certinfo(SSL) ->
          }.
 
 gen_tcp_listen(Port, Opts) ->
-    ?Debug("Listen ~p:~p~n", [Port, Opts]),
+    ?Debug("TCP Listen ~p:~p~n", [Port, Opts]),
     gen_tcp:listen(Port, Opts).
 
+ssl_listen(Port, Opts) ->
+    ?Debug("SSL Listen ~p:~p~n", [Port, Opts]),
+    ssl:listen(Port, Opts).
 
 gserv(_Top, _, []) ->
     proc_lib:init_ack(none);
@@ -477,15 +510,15 @@ gserv(Top, GC, Group0) ->
     put(gc, GC),
     put(top, Top),
     Group1 = map(fun(SC) -> setup_ets(SC)
-		 end, Group0),
+                 end, Group0),
     Group = map(fun(SC) ->
-			case ?sc_has_statistics(SC) of
-			    true ->
-				start_stats(SC);
-			    false ->
-				SC
-			end
-		end, Group1),
+                        case ?sc_has_statistics(SC) of
+                            true ->
+                                start_stats(SC);
+                            false ->
+                                SC
+                        end
+                end, Group1),
     SC = hd(Group),
     case do_listen(GC, SC) of
         {SSLBOOL, CertInfo, {ok, Listen}} ->
@@ -573,14 +606,14 @@ gserv_loop(GS, Ready, Rnum, Last) ->
                         connections = GS#gs.connections + 1},
             ?MODULE:gserv_loop(GS2, Ready, Rnum, New);
         {_From, next, Accepted} ->
-	    close_accepted_if_max(GS,Accepted),
+            close_accepted_if_max(GS,Accepted),
             [{_Then, R}|RS] = Ready,
             R ! {self(), accept},
- 	    GS2 = GS#gs{connections=GS#gs.connections + 1},
+            GS2 = GS#gs{connections=GS#gs.connections + 1},
             ?MODULE:gserv_loop(GS2, RS, Rnum-1, R);
-	{_From, decrement} ->
- 	    GS2 = GS#gs{connections=GS#gs.connections - 1},
- 	    ?MODULE:gserv_loop(GS2, Ready, Rnum, Last);
+        {_From, decrement} ->
+            GS2 = GS#gs{connections=GS#gs.connections - 1},
+            ?MODULE:gserv_loop(GS2, Ready, Rnum, Last);
         {From, done_client, Int} ->
             GS2 = if
                       Int == 0 -> GS#gs{connections = GS#gs.connections - 1};
@@ -594,7 +627,8 @@ gserv_loop(GS, Ready, Rnum, Last) ->
                     ?MODULE:gserv_loop(GS2, Ready, Rnum, Last);
                 Rnum < PoolSize ->
                     %% cache this process for 10 secs
-                    ?MODULE:gserv_loop(GS2, [{now(), From} | Ready], Rnum+1, Last)
+                    ?MODULE:gserv_loop(GS2, [{now(), From} | Ready],
+                                       Rnum+1, Last)
             end;
         {'EXIT', Pid, Reason} ->
             case get(top) of
@@ -607,11 +641,13 @@ gserv_loop(GS, Ready, Rnum, Last) ->
                     {links, Ls} = process_info(self(), links),
                     foreach(fun(X) -> unlink(X), exit(X, shutdown) end, Ls),
                     exit(normal);
-                _ when Reason == failaccept ->
+                Top when Reason == failaccept ->
                     error_logger:format(
                       "Accept proc died, terminate gserv",[]),
                     {links, Ls} = process_info(self(), links),
-                    foreach(fun(X) -> unlink(X), exit(X, shutdown) end, Ls),
+                    %% do not send exit signal to yaws_server process
+                    Ls1 = Ls -- [Top],
+                    foreach(fun(X) -> unlink(X), exit(X, shutdown) end, Ls1),
                     exit(noserver);
                 _ ->
                     GS2 = GS#gs{sessions = GS#gs.sessions - 1},
@@ -628,7 +664,8 @@ gserv_loop(GS, Ready, Rnum, Last) ->
                             case lists:keysearch(Pid, 2, Ready) of
                                 {value, _} ->
                                     Ready1 = lists:keydelete(Pid, 2, Ready),
-                                    ?MODULE:gserv_loop(GS2, Ready1, Rnum-1, Last);
+                                    ?MODULE:gserv_loop(GS2, Ready1,
+                                                       Rnum-1, Last);
                                 false ->
                                     ?MODULE:gserv_loop(GS2, Ready, Rnum, Last)
                             end
@@ -681,38 +718,33 @@ gserv_loop(GS, Ready, Rnum, Last) ->
 
         %% This code will shutdown all ready procs as well as the
         %% acceptor()
-        {update_sconf, NewSc, OldSc, From, Updater} ->
+        {update_sconf, Pos, NewSc, OldSc, From, Updater} ->
             case lists:member(OldSc, GS#gs.group) of
                 false ->
                     error_logger:error_msg("gserv: No found SC ~p/~p~n",
                                            [OldSc, GS#gs.group]),
                     erlang:error(nosc);
                 true ->
-		    Pid = OldSc#sconf.stats,
-		    error_logger:info_msg("update_sconf: Stats pid ~p~n",[Pid]),
-		    case Pid of
-			undefined ->
-			    ok;
-			Pid when is_pid(Pid) ->
-			    yaws_stats:stop(Pid)
-		    end,
-		    NewSc1 = case ?sc_has_statistics(NewSc) of
-				 true ->
-				     start_stats(NewSc);
-				 false ->
-				     NewSc
-			     end,
+                    Pid = OldSc#sconf.stats,
+                    error_logger:info_msg("update_sconf: Stats pid ~p~n",[Pid]),
+                    case Pid of
+                        undefined ->
+                            ok;
+                        Pid when is_pid(Pid) ->
+                            yaws_stats:stop(Pid)
+                    end,
+                    NewSc1 = case ?sc_has_statistics(NewSc) of
+                                 true ->
+                                     start_stats(NewSc);
+                                 false ->
+                                     NewSc
+                             end,
                     stop_ready(Ready, Last),
                     NewSc2 = clear_ets_complete(NewSc1),
-                    %% Need to insert the sconf at the same position
-                    %% it previously was
-                    NewG = lists:map(fun(Sc) when Sc == OldSc->
-                                             NewSc2;
-                                        (Other) ->
-                                             Other
-                                     end, GS#gs.group),
-
-                    GS2 = GS#gs{group = NewG},
+                    GS2 = GS#gs{group = yaws:insert_at(
+                                          NewSc2, Pos,
+                                          lists:delete(OldSc, GS#gs.group)
+                                         )},
                     Ready2 = [],
                     Updater ! {updated_sconf, self(), NewSc2},
                     gen_server:reply(From, ok),
@@ -728,19 +760,19 @@ gserv_loop(GS, Ready, Rnum, Last) ->
                     error_logger:error_msg("gserv: No found SC ~n",[]),
                     erlang:error(nosc);
                 true ->
-		    Pid = OldSc#sconf.stats,
+                    Pid = OldSc#sconf.stats,
                     stop_ready(Ready, Last),
                     GS2 = GS#gs{group =  lists:delete(OldSc,GS#gs.group)},
                     Ready2 = [],
-		    case ?sc_has_statistics(OldSc) of
-			true ->
-			    error_logger:info_msg("delete_sconf: Pid= ~p~n",
+                    case ?sc_has_statistics(OldSc) of
+                        true ->
+                            error_logger:info_msg("delete_sconf: Pid= ~p~n",
                                                   [Pid]),
-			    yaws_stats:stop(Pid);
-			false ->
-			    ok
-		    end,
-		    ets:delete(OldSc#sconf.ets),
+                            yaws_stats:stop(Pid);
+                        false ->
+                            ok
+                    end,
+                    ets:delete(OldSc#sconf.ets),
                     gen_server:reply(From, ok),
                     error_logger:info_msg("Deleting sconf for server ~s~n",
                                           [yaws:sconf_to_srvstr(OldSc)]),
@@ -748,18 +780,18 @@ gserv_loop(GS, Ready, Rnum, Last) ->
                     ?MODULE:gserv_loop(GS2, Ready2, 0, New)
             end;
 
-        {add_sconf, From, SC0, Adder} ->
-	    SC = case ?sc_has_statistics(SC0) of
-		     true ->
-			 {ok, Pid} = yaws_stats:start_link(),
-			 error_logger:info_msg("add_sconf: Pid= ~p~n", [Pid]),
-			 SC0#sconf{stats=Pid};
-		     false ->
-			 SC0
-		 end,
+        {add_sconf, From, Pos, SC0, Adder} ->
+            SC = case ?sc_has_statistics(SC0) of
+                     true ->
+                         {ok, Pid} = yaws_stats:start_link(),
+                         error_logger:info_msg("add_sconf: Pid= ~p~n", [Pid]),
+                         SC0#sconf{stats=Pid};
+                     false ->
+                         SC0
+                 end,
             stop_ready(Ready, Last),
             SC2 = setup_ets(SC),
-	    GS2 = GS#gs{group =  GS#gs.group ++ [SC2]},
+            GS2 = GS#gs{group =  yaws:insert_at(SC2, Pos, GS#gs.group)},
             Ready2 = [],
             Adder ! {added_sconf, self(), SC2},
             gen_server:reply(From, ok),
@@ -772,7 +804,7 @@ gserv_loop(GS, Ready, Rnum, Last) ->
                 case GS#gs.ssl of
                     ssl ->
                         CertInfo = GS#gs.certinfo,
-			case lists:any(
+                        case lists:any(
                                fun(SC) ->
                                        certinfo(SC#sconf.ssl) =/= CertInfo end,
                                GS#gs.group) of
@@ -836,9 +868,13 @@ stop_ready(Ready, Last) ->
       end, Ready).
 
 gserv_stop(Gpid) ->
-    Gpid ! {self(), stop},
-    receive
-        {Gpid, ok} ->
+    case is_process_alive(Gpid) of
+        true ->
+            Gpid ! {self(), stop},
+            receive
+                {Gpid, ok} -> ok
+            end;
+        false ->
             ok
     end.
 
@@ -867,16 +903,14 @@ listen_opts(_GC, SC) ->
                        []
                end,
     Opts = [binary,
-     {ip, SC#sconf.listen},
-     {packet, http},
-     {packet_size, 16#4000},
-     {recbuf, 8192},
-     {reuseaddr, true},
-     {backlog, 1024},
-     {active, false}
-     | proplists:get_value(listen_opts, SC#sconf.soptions, [])
-    ] ++ InetType,
-    ?Debug("listen options: ~p", [Opts]),
+            {ip, SC#sconf.listen},
+            {packet, http},
+            {packet_size, 16#4000},
+            {reuseaddr, true},
+            {active, false}
+            | proplists:get_value(listen_opts, SC#sconf.soptions, [])
+           ] ++ InetType,
+    ?Debug("tcp listen options: ~p", [Opts]),
     Opts.
 
 ssl_listen_opts(GC, SC, SSL) ->
@@ -886,14 +920,15 @@ ssl_listen_opts(GC, SC, SSL) ->
                    true ->
                        []
                end,
-    [binary,
-     {ip, SC#sconf.listen},
-     {packet, http},
-     {packet_size, 16#4000},
-     {recbuf, 8192},
-     {reuseaddr, true},
-     {active, false} | ssl_listen_opts(GC, SSL)] ++ InetType ++
-        proplists:get_value(listen_opts, SC#sconf.soptions, []).
+    Opts = [binary,
+            {ip, SC#sconf.listen},
+            {packet, http},
+            {packet_size, 16#4000},
+            {reuseaddr, true},
+            {active, false} | ssl_listen_opts(GC, SSL)] ++ InetType ++
+        proplists:get_value(listen_opts, SC#sconf.soptions, []),
+    ?Debug("ssl listen options: ~p", [Opts]),
+    Opts.
 
 ssl_listen_opts(GC, SSL) ->
     L = [if SSL#ssl.keyfile /= undefined ->
@@ -938,6 +973,11 @@ ssl_listen_opts(GC, SSL) ->
          end,
          if SSL#ssl.depth /= undefined ->
                  {depth, SSL#ssl.depth};
+            true ->
+                 false
+         end,
+         if SSL#ssl.secure_renegotiate /= undefined ->
+                 {secure_renegotiate, SSL#ssl.secure_renegotiate};
             true ->
                  false
          end,
@@ -993,17 +1033,17 @@ acceptor0(GS, Top) ->
                         {error, closed} ->
                             Top ! {self(), decrement},
                             exit(normal);
-			{error, esslaccept} ->
-			    %% Don't log SSL esslaccept to error log since it
-			    %% seems this is what we get on portscans and
-			    %% similar
-			    ?Debug("SSL accept failed: ~p~n", [esslaccept]),
-			    Top ! {self(), decrement},
+                        {error, esslaccept} ->
+                            %% Don't log SSL esslaccept to error log since it
+                            %% seems this is what we get on portscans and
+                            %% similar
+                            ?Debug("SSL accept failed: ~p~n", [esslaccept]),
+                            Top ! {self(), decrement},
                             exit(normal);
                         {error, Reason} ->
                             error_logger:format("SSL accept failed: ~p~n",
                                                 [Reason]),
-			    Top ! {self(), decrement},
+                            Top ! {self(), decrement},
                             exit(normal)
                     end;
                 true ->
@@ -1031,26 +1071,26 @@ acceptor0(GS, Top) ->
                 {ok, Int} when is_integer(Int) ->
                     Top ! {self(), done_client, Int};
                 {'EXIT', normal} ->
-		    Top ! {self(), decrement},
+                    Top ! {self(), decrement},
                     exit(normal);
                 {'EXIT', shutdown} ->
                     exit(shutdown);
                 {'EXIT', {error, einval}} ->
                     %% Typically clients that close their end of the socket
                     %% don't log. Happens all the time.
-		    Top ! {self(), decrement},
+                    Top ! {self(), decrement},
                     exit(normal);
                 {'EXIT', {{error, einval}, _}} ->
-		    Top ! {self(), decrement},
+                    Top ! {self(), decrement},
                     exit(normal);
                 {'EXIT', {error, closed}} ->
-		    Top ! {self(), decrement},
+                    Top ! {self(), decrement},
                     exit(normal);
                 {'EXIT', {{error, closed}, _}} ->
-		    Top ! {self(), decrement},
+                    Top ! {self(), decrement},
                     exit(normal);
                 {'EXIT', {{error, econnreset},_}} ->
-		    Top ! {self(), decrement},
+                    Top ! {self(), decrement},
                     exit(normal);
                 {'EXIT', Reason2} ->
                     error_logger:error_msg("Yaws process died: ~p~n",
@@ -1085,7 +1125,7 @@ acceptor0(GS, Top) ->
             end;
         {error, closed} ->
             %% This is what happens when we call yaws --stop
-	    Top ! {self(), decrement},
+            Top ! {self(), decrement},
             exit(normal);
         {error, Reason} when ((Reason == emfile) or
                                                    (Reason == enfile)) ->
@@ -1110,7 +1150,7 @@ acceptor0(GS, Top) ->
 %%% Internal functions
 %%%----------------------------------------------------------------------
 
-aloop(CliSock, {IP,Port}, GS, Num) ->
+aloop(CliSock, {IP,Port}=IPPort, GS, Num) ->
     case yaws_trace:get_type(GS#gs.gconf) of
         undefined ->
             ok;
@@ -1140,38 +1180,62 @@ aloop(CliSock, {IP,Port}, GS, Num) ->
             {Req, H} = fix_abs_uri(Req0, H0),
             ?Debug("{Req, H} = ~p~n", [{Req, H}]),
             SC = pick_sconf(GS#gs.gconf, H, GS#gs.group),
-            ?Debug("SC: ~s", [?format_record(SC, sconf)]),
-            ?TC([{record, SC, sconf}]),
-            ?Debug("Headers = ~s~n", [?format_record(H, headers)]),
-            ?Debug("Request = ~s~n", [?format_record(Req, http_request)]),
-            {PeerIP,PeerPort} = case {?sc_expect_proxy_header(SC), get(request_proxy_ip_port)} of
-				    {true, undefined} ->
-					error_logger:format("PROXY header missing on connection", []),
-					error_logger:format("Headers = ~s~n", [?format_record(H, headers)]),
-					error_logger:format("Request = ~s~n", [?format_record(Req, http_request)]),
-					exit(normal);
-				    {true, ProxyIP} ->
-					ProxyIP;
-				    {false, undefined} ->
-					{IP,Port};
-				    _ ->
-					error_logger:format("Ignoring extraneous PROXY header", []),
-					{IP,Port}
-				end,
-            run_trace_filter(GS, PeerIP, Req, H),
             put(outh, #outh{}),
             put(sc, SC),
-            yaws_stats:hit(),
-            check_keepalive_maxuses(GS, Num),
-            Call = case yaws_shaper:check(SC, PeerIP) of
-                       allow ->
-                           call_method(Req#http_request.method,CliSock,
-                                       {PeerIP,PeerPort},Req,H);
-                       {deny, Status, Msg} ->
-                           deliver_xxx(CliSock, Req, Status, Msg)
-                   end,
-            Call2 = fix_keepalive_maxuses(Call),
-            handle_method_result(Call2, CliSock, {PeerIP,PeerPort}, GS, Req, H, Num);
+            DispatchResult = case SC#sconf.dispatch_mod of
+                                 undefined ->
+                                     continue;
+                                 DispatchMod ->
+                                     Arg = make_arg(SC, CliSock, IPPort,
+                                                    H, Req, undefined),
+                                     ok = inet:setopts(CliSock,
+                                                       [{packet, raw},
+                                                        {active, false}]),
+                                     DispatchMod:dispatch(Arg)
+                             end,
+            case DispatchResult of
+                done ->
+                    erase_transients(),
+                    case exceed_keepalive_maxuses(GS, Num) of
+                        true  -> {ok, Num+1};
+                        false -> aloop(CliSock, IPPort, GS, Num+1)
+                    end;
+                closed ->
+                    %% Dispatcher closed the socket
+                    erase_transients(),
+                    {ok, Num+1};
+                continue ->
+		    ?Debug("SC: ~s", [?format_record(SC, sconf)]),
+		    ?TC([{record, SC, sconf}]),
+		    ?Debug("Headers = ~s~n", [?format_record(H, headers)]),
+		    ?Debug("Request = ~s~n", [?format_record(Req, http_request)]),
+		    {PeerIP,PeerPort} = case {?sc_expect_proxy_header(SC), get(request_proxy_ip_port)} of
+					    {true, undefined} ->
+						error_logger:format("PROXY header missing on connection", []),
+						error_logger:format("Headers = ~s~n", [?format_record(H, headers)]),
+						error_logger:format("Request = ~s~n", [?format_record(Req, http_request)]),
+						exit(normal);
+					    {true, ProxyIP} ->
+						ProxyIP;
+					    {false, undefined} ->
+						{IP,Port};
+					    _ ->
+						error_logger:format("Ignoring extraneous PROXY header", []),
+						{IP,Port}
+					end,
+		    run_trace_filter(GS, PeerIP, Req, H),
+		    yaws_stats:hit(),
+		    check_keepalive_maxuses(GS, Num),
+		    Call = case yaws_shaper:check(SC, PeerIP) of
+			       allow ->
+				   call_method(Req#http_request.method,CliSock,
+					       {PeerIP,PeerPort},Req,H);
+			       {deny, Status, Msg} ->
+				   deliver_xxx(CliSock, Req, Status, Msg)
+			   end,
+		    Call2 = fix_keepalive_maxuses(Call),
+		    handle_method_result(Call2, CliSock, {PeerIP,PeerPort}, GS, Req, H, Num);
+            end;
         closed ->
             case yaws_trace:get_type(GS#gs.gconf) of
                 undefined -> ok;
@@ -1209,15 +1273,15 @@ run_trace_filter(GS, IP, Req, H) ->
 %% process dictionary outh variable if required to say that the
 %% connection has exceeded its maxuses.
 check_keepalive_maxuses(GS, Num) ->
+    Flag = exceed_keepalive_maxuses(GS, Num),
+    put(outh, (get(outh))#outh{exceedmaxuses=Flag}).
+
+exceed_keepalive_maxuses(GS, Num) ->
     case (GS#gs.gconf)#gconf.keepalive_maxuses of
-        nolimit ->
-            ok;
-        0 ->
-            ok;
-        N when Num+1 < N ->
-            ok;
-        _N ->
-            put(outh, (get(outh))#outh{exceedmaxuses=true})
+        nolimit          -> false;
+        0                -> false;
+        N when Num+1 < N -> false;
+        _N               -> true
     end.
 
 %% Change to Res to 'done' if we've exceeded our maxuses.
@@ -1226,7 +1290,7 @@ fix_keepalive_maxuses(Res) ->
         continue ->
             case (get(outh))#outh.exceedmaxuses of
                 true ->
-                    done; %% no keepalive this time!
+                    done;  % no keepalive this time!
                 _ ->
                     Res
             end;
@@ -1282,7 +1346,8 @@ handle_method_result(Res, CliSock, {IP,Port}, GS, Req, H, Num) ->
             erase_transients(),
             {ok, Num+1};
         {page, P} ->
-            %% keep post_parse
+            %% Because the request is rewritten but the body is the same, we
+            %% keep post_parse and erase query_parse.
             erase(query_parse),
             put(outh, #outh{}),
             case P of
@@ -1300,15 +1365,31 @@ handle_method_result(Res, CliSock, {IP,Port}, GS, Req, H, Num) ->
             %% `is_reentrant_request' flag is used to correctly identify the url
             %% type
             put(is_reentrant_request, true),
-            SC = pick_sconf(GS#gs.gconf, H, GS#gs.group),
-            put(sc, SC#sconf{appmods = []}),
-            check_keepalive_maxuses(GS, Num),
-            Call = call_method(Req#http_request.method,
-                               CliSock, {IP,Port},
-                               Req#http_request{path = {abs_path, Page}},
-                               H#headers{content_length = undefined}),
+
+            %% Renew #sconf{} to restore docroot/xtra_docroots fields
+            OldSC = get(sc),
+            NewSC = pick_sconf(GS#gs.gconf, H, GS#gs.group),
+            put(sc, NewSC#sconf{appmods = OldSC#sconf.appmods}),
+
+            %% Rewrite the request
+            NextReq = Req#http_request{path = {abs_path, Page}},
+
+            %% Renew #arg{}: keep clidata, state and cont
+            Arg0 = case get(yaws_arg) of
+                       undefined -> #arg{};
+                       A         -> A
+                   end,
+            Arg1 = make_arg(CliSock, {IP,Port}, H, NextReq, Arg0#arg.clidata),
+            Arg2 = Arg1#arg{cont=Arg0#arg.cont, state=Arg0#arg.state},
+
+            %% Get the number of bytes already read and do the reentrant call
+            CliDataPos = case get(client_data_pos) of
+                             undefined -> 0;
+                             Pos       -> Pos
+                         end,
+            Call  = handle_request(CliSock, Arg2, CliDataPos),
             Call2 = fix_keepalive_maxuses(Call),
-            handle_method_result(Call2, CliSock, {IP,Port}, GS, Req, H, Num)
+            handle_method_result(Call2, CliSock, {IP,Port}, GS, NextReq, H, Num)
     end.
 
 
@@ -1369,10 +1450,45 @@ comp_sname(_, []) ->
     false;
 comp_sname([C1|T1], [C2|T2]) ->
     case string:to_lower(C1) == string:to_lower(C2) of
-        true ->
-            comp_sname(T1, T2);
-        false ->
-            false
+        true  -> comp_sname(T1, T2);
+        false -> false
+    end.
+
+%% Same thing than comp_sname but here we compare a pattern containing
+%% wildcards:
+%%   - '*' matches any sequence of zero or more characters
+%%   - '?' matches one character unless that character is a period ('.')
+wildcomp_salias([], []) ->
+    true;
+wildcomp_salias([$:|_], [$:|_]) ->
+    true;
+wildcomp_salias([$:|_], []) ->
+    true;
+wildcomp_salias([], [$:|_]) ->
+    true;
+wildcomp_salias([$:|_], _) ->
+    false;
+wildcomp_salias(_, [$:|_]) ->
+    false;
+wildcomp_salias([], _) ->
+    false;
+wildcomp_salias(_, []) ->
+    false;
+wildcomp_salias([$.|_], [$?|_]) ->
+    false;
+wildcomp_salias([_|T1], [$?|T2]) ->
+    wildcomp_salias(T1, T2);
+wildcomp_salias(_, [$*]) ->
+    true;
+wildcomp_salias([_|T1]=Str, [$*|T2]=Pattern) ->
+    case wildcomp_salias(Str, T2) of
+        true  -> true;
+        false -> wildcomp_salias(T1, Pattern)
+    end;
+wildcomp_salias([C1|T1], [C2|T2]) ->
+    case string:to_lower(C1) == string:to_lower(C2) of
+        true  -> wildcomp_salias(T1, T2);
+        false -> false
     end.
 
 pick_sconf(GC, H, Group) ->
@@ -1396,8 +1512,15 @@ pick_host(GC, Host, SCs, Group)
     end;
 pick_host(GC, Host, [SC|T], Group) ->
     case comp_sname(Host, SC#sconf.servername) of
-        true -> SC;
-        false -> pick_host(GC, Host, T, Group)
+        true  ->
+            SC;
+        false ->
+            Res = lists:any(fun(Alias) -> wildcomp_salias(Host, Alias) end,
+                            SC#sconf.serveralias),
+            case Res of
+                true  -> SC;
+                false -> pick_host(GC, Host, T, Group)
+            end
     end.
 
 maybe_auth_log(Item, ARG) ->
@@ -1443,23 +1566,7 @@ decode_path({abs_path, Path}) ->
 'POST'(CliSock, IPPort, Req, Head) ->
     ?Debug("POST Req=~s~n H=~s~n", [?format_record(Req, http_request),
                                     ?format_record(Head, headers)]),
-
-    OtherHeaders = Head#headers.other,
-    Continue =
-        case lists:keysearch("Expect", 3, OtherHeaders) of
-            {value, {_,_,"Expect",_,Value}} ->
-                Value;
-            _ ->
-                ""
-        end,
-    case yaws:to_lower(Continue) of
-        "100-continue" ->
-            deliver_100(CliSock),
-            body_method(CliSock, IPPort, Req, Head);
-        _ ->
-            body_method(CliSock, IPPort, Req, Head)
-    end.
-
+    body_method(CliSock, IPPort, Req, Head).
 
 
 un_partial({partial, Bin}) ->
@@ -1504,40 +1611,42 @@ not_implemented(CliSock, _IPPort, Req, Head) ->
 'PUT'(CliSock, IPPort, Req, Head) ->
     ?Debug("PUT Req=~p~n H=~p~n", [?format_record(Req, http_request),
                                    ?format_record(Head, headers)]),
-    body_method(CliSock, IPPort, Req, Head).
-
+    SC=get(sc),
+    case ?sc_has_dav(SC) of
+        true ->
+            %% body is handled by yaws_dav:put/1
+            ok = yaws:setopts(CliSock, [{packet, raw}, binary],
+                              yaws:is_ssl(SC)),
+            ARG = make_arg(CliSock, IPPort, Head, Req, undefined),
+            handle_request(CliSock, ARG, 0);
+        false ->
+            body_method(CliSock, IPPort, Req, Head)
+    end.
 
 'DELETE'(CliSock, IPPort, Req, Head) ->
-    no_body_method(CliSock, IPPort, Req, Head).
+    body_method(CliSock, IPPort, Req, Head).
 
 'PATCH'(CliSock, IPPort, Req, Head) ->
     ?Debug("PATCH Req=~p~n H=~p~n", [?format_record(Req, http_request),
                                      ?format_record(Head, headers)]),
     body_method(CliSock, IPPort, Req, Head).
 
-%%%
-%%% WebDav specifics: PROPFIND, MKCOL,....
-%%%
-'PROPFIND'(CliSock, IPPort, Req, Head) ->
-    %%?elog("PROPFIND Req=~p H=~p~n",
-    %%                   [?format_record(Req, http_request),
-    %%                    ?format_record(Head, headers)]),
-    body_method(CliSock, IPPort, Req, Head).
-
-'MOVE'(CliSock, IPPort, Req, Head) ->
-    no_body_method(CliSock, IPPort, Req, Head).
-
-'COPY'(CliSock, IPPort, Req, Head) ->
-    no_body_method(CliSock, IPPort, Req, Head).
-
-
 body_method(CliSock, IPPort, Req, Head) ->
     SC=get(sc),
     ok = yaws:setopts(CliSock, [{packet, raw}, binary], yaws:is_ssl(SC)),
     PPS = SC#sconf.partial_post_size,
+    case yaws_api:get_header(Head, {lower, "expect"}) of
+        undefined ->
+            ok;
+        Value ->
+            case yaws:to_lower(Value) of
+                "100-continue" -> deliver_100(CliSock);
+                _ -> ok
+            end
+    end,
     Res = case Head#headers.content_length of
               undefined ->
-                  case Head#headers.transfer_encoding of
+                  case yaws:to_lower(Head#headers.transfer_encoding) of
                       "chunked" ->
                           get_chunked_client_data(CliSock, yaws:is_ssl(SC));
                       _ ->
@@ -1580,8 +1689,6 @@ body_method(CliSock, IPPort, Req, Head) ->
     end.
 
 
-'MKCOL'(CliSock, IPPort, Req, Head) ->
-    no_body_method(CliSock, IPPort, Req, Head).
 
 no_body_method(CliSock, IPPort, Req, Head) ->
     SC=get(sc),
@@ -1594,6 +1701,8 @@ no_body_method(CliSock, IPPort, Req, Head) ->
 
 make_arg(CliSock0, IPPort, Head, Req, Bin) ->
     SC = get(sc),
+    make_arg(SC, CliSock0, IPPort, Head, Req, Bin).
+make_arg(SC, CliSock0, IPPort, Head, Req, Bin) ->
     CliSock = case yaws:is_ssl(SC) of
                   nossl ->
                       CliSock0;
@@ -1604,6 +1713,7 @@ make_arg(CliSock0, IPPort, Head, Req, Bin) ->
                client_ip_port = IPPort,
                headers = Head,
                req = Req,
+               orig_req = Req,
                opaque = SC#sconf.opaque,
                pid = self(),
                docroot = SC#sconf.docroot,
@@ -1621,17 +1731,8 @@ make_arg(CliSock0, IPPort, Head, Req, Bin) ->
 %% unnecessary.
 handle_extension_method("PATCH", CliSock, IPPort, Req, Head) ->
     'PATCH'(CliSock, IPPort, Req#http_request{method = 'PATCH'}, Head);
-handle_extension_method("PROPFIND", CliSock, IPPort, Req, Head) ->
-    'PROPFIND'(CliSock, IPPort, Req, Head);
-handle_extension_method("MKCOL", CliSock, IPPort, Req, Head) ->
-    'MKCOL'(CliSock, IPPort, Req, Head);
-handle_extension_method("MOVE", CliSock, IPPort, Req, Head) ->
-    'MOVE'(CliSock, IPPort, Req, Head);
-handle_extension_method("COPY", CliSock, IPPort, Req, Head) ->
-    'COPY'(CliSock, IPPort, Req, Head);
 handle_extension_method(_Method, CliSock, IPPort, Req, Head) ->
-    not_implemented(CliSock, IPPort, Req, Head).
-
+    body_method(CliSock, IPPort, Req, Head).
 
 %% Return values:
 %% continue, done, {page, Page}
@@ -1658,8 +1759,11 @@ handle_request(CliSock, ARG, _N)
         _ ->
             %% Define a default content type if needed
             case yaws:outh_get_content_type() of
-                undefined -> yaws:outh_set_content_type("text/plain");
-                _         -> ok
+                undefined ->
+                    Mime = mime_types:default_type(get(sc)),
+                    yaws:outh_set_content_type(Mime);
+                _ ->
+                    ok
             end,
             accumulate_content(State#rewrite_response.content),
             deliver_accumulated(ARG, CliSock, undefined, final)
@@ -1739,7 +1843,9 @@ handle_request(CliSock, ARG, N) ->
 
                     case {IsRev, IsRedirect} of
                         {_, {true, Redir}} ->
-                            deliver_302_map(CliSock, Req, ARG, Redir);
+                            ARG1 = ARG#arg{server_path = DecPath,
+                                           querydata   = QueryString},
+                            deliver_redirect_map(CliSock, Req, ARG1, Redir, N);
                         {false, _} ->
                             %%'main' branch so to speak. Most requests
                             %% pass through here.
@@ -1777,7 +1883,6 @@ handle_normal_request(CliSock, ARG, UT, Authdirs, N) ->
                          {true, User} -> {true, set_auth_user(ARG, User)};
                          E            -> {E, ARG}
                      end,
-
     case IsAuth of
         true ->
             %%!todo - remove special treatment of appmod here. (after suitable
@@ -1803,7 +1908,7 @@ handle_normal_request(CliSock, ARG, UT, Authdirs, N) ->
             end,
             handle_ut(CliSock, ARG2, UT, N);
         false_403 ->
-            deliver_403(CliSock, ARG1#arg.req);
+            deliver_403(CliSock, ARG1#arg.orig_req);
         {false, AuthMethods, Realm} ->
             UT1 = #urltype{type = {unauthorized, AuthMethods, Realm},
                            path = ARG1#arg.server_path},
@@ -1848,15 +1953,37 @@ filter_auths([_|T], Req_dir, Auths) ->
 
 
 %% Call is_auth(...)/5 with a default value.
-is_auth(ARG, L) ->
-    Req_dir = ARG#arg.server_path,
-    H       = ARG#arg.headers,
+is_auth(#arg{req=Req, orig_req=Req}=ARG, L) ->
     case lists:keyfind(ARG#arg.docroot, 1, L) of
-        {_, Auths} ->
-            is_auth(ARG, Req_dir, H, filter_auths(Auths, Req_dir), {true, []});
-        false ->
-            {true, []}
+        {_, Auths} -> is_req_auth(ARG, Auths, true);
+        false      -> true
+    end;
+is_auth(ARG, L) ->
+    case lists:keyfind(ARG#arg.docroot, 1, L) of
+        {_, Auths} -> is_req_auth(ARG, Auths, is_orig_req_auth(ARG,Auths,true));
+        false      -> true
     end.
+
+is_orig_req_auth(#arg{orig_req=OrigReq, headers=H}=ARG, Auths, Ret) ->
+    case OrigReq#http_request.path of
+        {abs_path, RawPath} ->
+            case (catch yaws_api:url_decode_q_split(RawPath)) of
+                {'EXIT', _} ->
+                    Ret;
+                {DecPath, _} ->
+                    is_auth(ARG, DecPath, H, filter_auths(Auths, DecPath),
+                            {true, []})
+            end;
+        _ ->
+            Ret
+    end.
+
+is_req_auth(#arg{server_path=Req_dir, headers=H}=ARG, Auths, Ret) ->
+    case is_auth(ARG, Req_dir, H, filter_auths(Auths, Req_dir), {true, []}) of
+        true -> Ret;
+        Else -> Else
+    end.
+
 
 %% Either no authentication was done or all methods returned false
 is_auth(_ARG, _Req_dir, _H, [], {Ret, Auth_headers}) ->
@@ -1866,8 +1993,8 @@ is_auth(_ARG, _Req_dir, _H, [], {Ret, Auth_headers}) ->
 is_auth(ARG, Req_dir, H, [Auth_methods|T], {_Ret, Auth_headers}) ->
     Auth_H = H#headers.authorization,
     case handle_auth(ARG, Auth_H, Auth_methods, false) of
-		%% If we auth using an authmod we need to return User
-		%% so that we can set it in ARG.
+                %% If we auth using an authmod we need to return User
+                %% so that we can set it in ARG.
         {false, A} ->
             L = A#auth.headers,
             Auth_methods1 = Auth_methods#auth{realm = A#auth.realm,
@@ -1875,82 +2002,62 @@ is_auth(ARG, Req_dir, H, [Auth_methods|T], {_Ret, Auth_headers}) ->
             is_auth(ARG, Req_dir, H, T,
                     {{false, Auth_methods1, A#auth.realm}, L ++ Auth_headers});
         Is_auth -> %% true, {true, User} or false_403
-		    Is_auth
+                    Is_auth
     end.
 
 handle_auth(#arg{client_ip_port={IP,_}}=ARG, Auth_H,
             #auth{acl={AllowIPs, DenyIPs, Order}}=Auth_methods, Ret) ->
-    %% Transform Client IP address in integer
-    IntIP =
-        case IP of
-            undefined ->
-                0;
-            {0,0,0,0,0,16#FFFF,N1,N2} ->
-                (N1 bsl 16) bor N2;
-            {N1,N2,N3,N4} ->
-                (N1 bsl 24) bor (N2 bsl 16) bor (N3 bsl 8) bor N4;
-            {N1,N2,N3,N4,N5,N6,N7,N8} ->
-                (N1 bsl 112) bor (N2 bsl 96) bor (N3 bsl 80) bor (N4 bsl 64) bor
-                    (N5 bsl 48) bor (N6 bsl 32) bor (N7 bsl 16) bor N8
-        end,
-
-    %% Build the match_spec to test ACLs
-    MHead = {'$1', '$2'},
-    Guard = {'andalso',
-             {'=<', '$1', {const, IntIP}},
-             {'>=', '$2', {const, IntIP}}},
-    MSpec = [{MHead, [Guard], [true]}],
-    CMSpec = ets:match_spec_compile(MSpec),
-
+    Fun  = fun(IpMask) -> yaws:match_ipmask(IP, IpMask) end,
     Ret1 = case Auth_methods of
                #auth{users=[],pam=false,mod=[]} -> true;
                _                                -> Ret
            end,
-
     case {AllowIPs, DenyIPs, Order} of
         {_, all, deny_allow} ->
-            case ets:match_spec_run(AllowIPs, CMSpec) of
-                [true|_] ->
+            case lists:any(Fun, AllowIPs) of
+                true ->
                     handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none}, Ret1);
-                _ ->
+                false ->
                     false_403
             end;
         {all, _, deny_allow} ->
             handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none}, Ret1);
         {_, _, deny_allow} ->
-            case ets:match_spec_run(DenyIPs, CMSpec) of
-                [true|_] ->
-                    case ets:match_spec_run(AllowIPs, CMSpec) of
-                        [true|_] ->
-                            handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none},
+            case lists:any(Fun, DenyIPs) of
+                true ->
+                    case lists:any(Fun, AllowIPs) of
+                        true ->
+                            handle_auth(ARG, Auth_H,
+                                        Auth_methods#auth{acl=none},
                                         Ret1);
-                        _ ->
+                        false ->
                             false_403
                     end;
-                _ ->
+                false ->
                     handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none}, Ret1)
             end;
 
         {_, all, allow_deny} ->
             false_403;
         {all, _, allow_deny} ->
-            case ets:match_spec_run(DenyIPs, CMSpec) of
-                [true|_] ->
+            case lists:any(Fun, DenyIPs) of
+                true ->
                     false_403;
-                _ ->
+                false ->
                     handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none}, Ret1)
             end;
         {_, _, allow_deny} ->
-            case ets:match_spec_run(AllowIPs, CMSpec) of
-                [true|_] ->
-                    case ets:match_spec_run(DenyIPs, CMSpec) of
-                        [true|_] ->
+            case lists:any(Fun, AllowIPs) of
+                true ->
+                    case lists:any(Fun, DenyIPs) of
+                        true ->
                             false_403;
-                        _ ->
-                            handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none},
+                        false ->
+                            handle_auth(ARG, Auth_H,
+                                        Auth_methods#auth{acl=none},
                                         Ret1)
                     end;
-                _ ->
+                false ->
                     false_403
             end
     end;
@@ -1971,7 +2078,11 @@ handle_auth(ARG, Auth_H, Auth_methods = #auth{mod = Mod}, Ret) when Mod /= [] ->
                    [Mod, ARG, Auth_methods, Reason,
                     erlang:get_stacktrace()]),
             handle_crash(ARG, L),
-            deliver_accumulated(ARG#arg.clisock),
+            CliSock = case yaws_api:get_sslsocket(ARG#arg.clisock) of
+                          {ok, SslSock} -> SslSock;
+                          undefined     -> ARG#arg.clisock
+                      end,
+            deliver_accumulated(CliSock),
             exit(normal);
 
         %% appmod means the auth headers are undefined, i.e. false.
@@ -1986,8 +2097,8 @@ handle_auth(ARG, Auth_H, Auth_methods = #auth{mod = Mod}, Ret) when Mod /= [] ->
         {false, Realm} ->
             handle_auth(ARG, Auth_H, Auth_methods#auth{mod=[], realm=Realm},
                         Ret);
-        {appmod, Mod} ->
-            handle_auth(ARG, Auth_H, Auth_methods#auth{mod=[], outmod=Mod},
+        {appmod, Module} ->
+            handle_auth(ARG, Auth_H, Auth_methods#auth{mod=[], outmod=Module},
                         Ret);
         _ ->
             maybe_auth_log(403, ARG),
@@ -2001,22 +2112,22 @@ handle_auth(ARG, undefined, Auth_methods, Ret) ->
 handle_auth(ARG, {User, Password, OrigString},
             Auth_methods = #auth{pam = Pam}, Ret) when Pam /= false ->
     case yaws_pam:auth(User, Password) of
-	{yes, _} ->
-	    maybe_auth_log({ok, User}, ARG),
-	    true;
-	{no, _Rsn} ->
-	    handle_auth(ARG, {User, Password, OrigString},
+        {yes, _} ->
+            maybe_auth_log({ok, User}, ARG),
+            true;
+        {no, _Rsn} ->
+            handle_auth(ARG, {User, Password, OrigString},
                         Auth_methods#auth{pam = false}, Ret)
     end;
 
 handle_auth(ARG, {User, Password, OrigString},
             Auth_methods = #auth{users = Users}, Ret) when Users /= [] ->
     case member({User, Password}, Users) of
-	true ->
-	    maybe_auth_log({ok, User}, ARG),
-	    true;
-	false ->
-	    handle_auth(ARG, {User, Password, OrigString},
+        true ->
+            maybe_auth_log({ok, User}, ARG),
+            true;
+        false ->
+            handle_auth(ARG, {User, Password, OrigString},
                         Auth_methods#auth{users = []}, Ret)
     end.
 
@@ -2049,7 +2160,7 @@ is_redirect_map(_, []) ->
     false;
 is_redirect_map(Path, RedirMap) ->
     case lists:keyfind(Path, 1, RedirMap) of
-        {Path, _Url, _AppendMod}=E ->
+        {Path, _Code, _Url, _AppendMod}=E ->
             {true, E};
         false when Path == "/" ->
             false;
@@ -2275,16 +2386,22 @@ handle_ut(CliSock, ARG, UT = #urltype{type = directory}, N) ->
     end;
 
 
-handle_ut(CliSock, ARG, UT = #urltype{type = redir}, _N) ->
+handle_ut(CliSock, ARG, UT = #urltype{type = redir}, N) ->
     Req = ARG#arg.req,
     H = ARG#arg.headers,
     yaws:outh_set_dyn_headers(Req, H, UT),
+    case yaws:outh_get_doclose() of
+        true  -> ok;
+        _     -> flush(CliSock, N, H#headers.content_length,
+                       yaws:to_lower(H#headers.transfer_encoding))
+    end,
     deliver_302(CliSock, Req, ARG, UT#urltype.path);
 
 handle_ut(CliSock, ARG, UT = #urltype{type = appmod}, N) ->
     Req = ARG#arg.req,
     H = ARG#arg.headers,
     yaws:outh_set_dyn_headers(Req, H, UT),
+    maybe_set_page_options(),
     {Mod,_} = UT#urltype.data,
     deliver_dyn_part(CliSock,
                      0, "appmod",
@@ -2329,32 +2446,29 @@ handle_ut(CliSock, ARG, UT = #urltype{type = fcgi}, N) ->
 handle_ut(CliSock, ARG, UT = #urltype{type = dav}, N) ->
     Req = ARG#arg.req,
     H = ARG#arg.headers,
-    SC=get(sc),
     Next =
-        if
-            Req#http_request.method == 'OPTIONS' ->
+        case Req#http_request.method of
+            'OPTIONS' ->
                 options;
-            Req#http_request.method == 'PUT' ->
-                fun(A) -> yaws_dav:put(SC, A) end;
-            Req#http_request.method == 'DELETE' ->
-                fun(A) -> yaws_dav:delete(A) end;
-            Req#http_request.method == "PROPFIND" ->
-                fun(A)-> yaws_dav:propfind(A) end;
-            Req#http_request.method == "MOVE" ->
-                fun(A)-> yaws_dav:move(A) end;
-            Req#http_request.method == "COPY" ->
-                fun(A)-> yaws_dav:copy(A) end;
-            Req#http_request.method == "MKCOL" ->
-                fun(A)-> yaws_dav:mkcol(A) end;
-            Req#http_request.method == 'GET';
-            Req#http_request.method == 'HEAD' ->
+            _ when Req#http_request.method == 'GET';
+                   Req#http_request.method == 'HEAD' ->
                 case prim_file:read_file_info(UT#urltype.fullpath) of
                     {ok, FI} when FI#file_info.type == regular ->
                         {regular, FI};
                     _ ->
                         error
                 end;
-            true ->
+            _Dav when Req#http_request.method == 'PUT';
+                      Req#http_request.method == 'DELETE';
+                      Req#http_request.method == "PROPFIND";
+                      Req#http_request.method == "PROPPATCH";
+                      Req#http_request.method == "LOCK";
+                      Req#http_request.method == "UNLOCK";
+                      Req#http_request.method == "MOVE";
+                      Req#http_request.method == "COPY";
+                      Req#http_request.method == "MKCOL" ->
+                dav;
+            _ ->
                 error
         end,
     case Next of
@@ -2365,7 +2479,7 @@ handle_ut(CliSock, ARG, UT = #urltype{type = dav}, N) ->
         {regular, Finfo} ->
             handle_ut(CliSock, ARG, UT#urltype{type = regular,
                                                finfo = Finfo}, N);
-        _ ->
+        dav ->
             yaws:outh_set_dyn_headers(Req, H, UT),
             maybe_set_page_options(),
             deliver_dyn_part(CliSock,
@@ -2373,7 +2487,7 @@ handle_ut(CliSock, ARG, UT = #urltype{type = dav}, N) ->
                              N,
                              ARG,UT,
                              Next,
-                             fun(A)->finish_up_dyn_file(A, CliSock)  end
+                             fun(A) -> finish_up_dyn_file(A, CliSock) end
                             )
     end;
 
@@ -2420,7 +2534,7 @@ done_or_continue() ->
         true -> done;
         false -> continue;
         keep_alive -> continue;
-	undefined -> continue
+        undefined -> continue
     end.
 
 %% we may have content,
@@ -2437,66 +2551,91 @@ new_redir_h(OH, Loc, Status) ->
 %% we must deliver a 302 if the browser asks for a dir
 %% without a trailing / in the HTTP req
 %% otherwise the relative urls in /dir/index.html will be broken.
-
-%%!todo - review.
-%% Why is DecPath being tokenized around "?" - only to reassemble??
-%% What happens when Path is not flat?
-
+%% Note: Here Path is always decoded, so we must encode it
 deliver_302(CliSock, _Req, Arg, Path) ->
     ?Debug("in redir 302 ",[]),
     H = get(outh),
     SC=get(sc),
-    Scheme = yaws:redirect_scheme(SC),
+    Scheme  = yaws:redirect_scheme(SC),
     Headers = Arg#arg.headers,
-    DecPath = yaws_api:url_decode(Path),
+    EncPath = yaws_api:url_encode(Path),
     RedirHost = yaws:redirect_host(SC, Headers#headers.host),
-    Loc = case string:tokens(DecPath, "?") of
-              [P] ->
-                  ["Location: ", Scheme, RedirHost, P, "\r\n"];
-              [P, Q] ->
-                  ["Location: ", Scheme, RedirHost, P, "?", Q, "\r\n"]
-          end,
 
+    %% QueryString must be added
+    Loc = case Arg#arg.querydata of
+              undefined -> ["Location: ", Scheme, RedirHost, EncPath, "\r\n"];
+              [] -> ["Location: ", Scheme, RedirHost, EncPath, "\r\n"];
+              Q -> ["Location: ", Scheme, RedirHost, EncPath, "?", Q, "\r\n"]
+          end,
     new_redir_h(H, Loc),
     deliver_accumulated(CliSock),
     done_or_continue().
 
 
-deliver_302_map(CliSock, Req, Arg,
-                {_Prefix,URL,Mode})  when is_record(URL,url) ->
-    ?Debug("in redir 302 ",[]),
-    H = get(outh),
-    DecPath = safe_decode_path(Req#http_request.path),
-    {P, Q} = yaws:split_at(DecPath, $?),
-    LocPath = yaws_api:format_partial_url(URL, get(sc)),
-    Loc = if
-              Mode == append ->
-                  Newpath = filename:join([URL#url.path ++ P]),
-                  NLocPath = yaws_api:format_partial_url(
-                               URL#url{path = Newpath}, get(sc)),
-                  case Q of
-                      [] ->
-                          ["Location: ", NLocPath, "\r\n"];
-                      _Q ->
-                          ["Location: ", NLocPath, "?", Q, "\r\n"]
-                  end;
-              Mode == noappend,Q == [] ->
-                  ["Location: ", LocPath, "\r\n"];
-              Mode == noappend,Q /= [] ->
-                  ["Location: ", LocPath, "?", Q, "\r\n"]
-          end,
-    Headers = Arg#arg.headers,
-    {DoClose, _Chunked} = yaws:dcc(Req, Headers),
-    new_redir_h(H#outh{
-                  connection  = yaws:make_connection_close_header(DoClose),
-                  doclose = DoClose,
-                  server = yaws:make_server_header(),
-                  chunked = false,
-                  date = yaws:make_date_header()
-                 }, Loc),
+deliver_redirect_map(CliSock, Req, _Arg,
+                     {_Prefix, Code, undefined, _Mode}, _N) ->
+    %% Here Code is 1xx, 2xx, 4xx or 5xx
+    ?Debug("in redir ~p", [Code]),
+    deliver_xxx(CliSock, Req, Code);
+deliver_redirect_map(_CliSock, _Req, Arg,
+                     {_Prefix, Code, Path, Mode}, N) when is_list(Path) ->
+    %% Here Code is 1xx, 2xx, 4xx or 5xx
+    ?Debug("in redir ~p", [Code]),
+    Path1 = if
+                Mode == append ->
+                    EncPath = yaws_api:url_encode(Arg#arg.server_path),
+                    filename:join([Path ++ EncPath]);
+                true -> %% noappend
+                    Path
+            end,
+    Page = case Arg#arg.querydata of
+               undefined -> Path1;
+               []        -> Path1;
+               Q         -> Path1 ++ "?" ++ Q
+           end,
 
+    %% Set variables used in handle_method_result/7
+    put(yaws_arg, Arg),
+    put(client_data_pos, N),
+    {page, {[{status, Code}], Page}};
+deliver_redirect_map(CliSock, Req, Arg,
+                     {_Prefix, Code, URL, Mode}, N) when is_record(URL, url) ->
+    %% Here Code is 3xx
+    ?Debug("in redir ~p", [Code]),
+    H = get(outh),
+    QueryData = case Arg#arg.querydata of
+                    undefined -> [];
+                    Q         -> Q
+                end,
+    LocPath = if
+                  Mode == append ->
+                      EncPath = yaws_api:url_encode(Arg#arg.server_path),
+                      Path1   = filename:join([URL#url.path ++ EncPath]),
+                      yaws_api:format_partial_url(
+                        URL#url{path=Path1,querypart=QueryData}, get(sc)
+                       );
+                  true -> %% noappend
+                      yaws_api:format_partial_url(URL#url{querypart=QueryData},
+                                                  get(sc))
+              end,
+    Loc = ["Location: ", LocPath, "\r\n"],
+
+    {DoClose, _Chunked} = yaws:dcc(Req, Arg#arg.headers),
+    case DoClose of
+        true  -> ok;
+        _     -> flush(CliSock, N, (Arg#arg.headers)#headers.content_length,
+                       (Arg#arg.headers)#headers.transfer_encoding)
+    end,
+    new_redir_h(H#outh{
+                  connection = yaws:make_connection_close_header(DoClose),
+                  doclose    = DoClose,
+                  server     = yaws:make_server_header(),
+                  chunked    = false,
+                  date       = yaws:make_date_header()
+                 }, Loc, Code),
     deliver_accumulated(CliSock),
     done_or_continue().
+
 
 deliver_options(CliSock, _Req, Options) ->
     H = #outh{status = 200,
@@ -2641,7 +2780,8 @@ get_chunked_client_data(CliSock,SSL) ->
                   undefined;
               Val =:= undefined ->
                   yaws:setopts(CliSock, [binary, {packet, line}],SSL),
-                  N = yaws:get_chunk_num(CliSock,SSL),
+                  %% Ignore chunk extentions
+                  {N, _Exts} = yaws:get_chunk_header(CliSock, SSL),
                   yaws:setopts(CliSock, [binary, {packet, raw}],SSL),
                   N;
               true ->
@@ -2654,7 +2794,8 @@ get_chunked_client_data(CliSock,SSL) ->
             <<>>;
         Len == 0 ->
             put(current_chunk_size, 0),
-            _Tmp=yaws:do_recv(CliSock, 2, SSL),%% flush last crnl
+            %% Ignore chunk trailer
+            yaws:get_chunk_trailer(CliSock, SSL),
             <<>>;
         Len =< SC#sconf.partial_post_size ->
             B = yaws:get_chunk(CliSock, Len, 0, SSL),
@@ -2677,6 +2818,8 @@ deliver_dyn_part(CliSock,                       % essential params
                  DeliverCont                    % call DeliverCont(Arg)
                                                 % to continue normally
                 ) ->
+    %% Note: yaws_arg and client_data_pos are also used in
+    %% handle_method_result/7 when `{page, Page}' is returned
     put(yaws_ut, UT),
     put(yaws_arg, Arg),
     put(client_data_pos, CliDataPos0),
@@ -2685,12 +2828,13 @@ deliver_dyn_part(CliSock,                       % essential params
                    handle_out_reply(Res, LineNo, YawsFile, UT, Arg)
                catch
                    Class:Exc ->
-                       handle_out_reply({throw, Class, Exc}, LineNo, YawsFile, UT, Arg)
+                       handle_out_reply({throw, Class, Exc}, LineNo,
+                                        YawsFile, UT, Arg)
                end,
     case OutReply of
         {get_more, Cont, State} when element(1, Arg#arg.clidata) == partial  ->
             CliDataPos1 = get(client_data_pos),
-            More = get_more_post_data(CliDataPos1, Arg),
+            More = get_more_post_data(CliSock, CliDataPos1, Arg),
             A2 = Arg#arg{clidata=More, cont=Cont, state=State},
             deliver_dyn_part(
               CliSock, LineNo, YawsFile, CliDataPos1+size(un_partial(More)),
@@ -2785,72 +2929,33 @@ deliver_dyn_file(CliSock, _Bin, [], ARG,_UT,_N) ->
     finish_up_dyn_file(ARG, CliSock).
 
 
-stream_loop_send(Priv, CliSock, Timeout) ->
-    {ok, FlushTimer} = timer:send_after(300, flush_timer),
-    case Timeout of
-	infinity ->
-	    untimed_stream_loop_send(Priv, CliSock, FlushTimer);
-	_ ->
-	    {ok, TimeoutTimer} = timer:send_after(Timeout, timeout_timer),
-	    stream_loop_send(Priv, CliSock, Timeout,
-			     FlushTimer, TimeoutTimer)
-    end.
+-define(unflushed_timeout, 300).
 
-untimed_stream_loop_send(Priv, CliSock, FlushTimer) ->
+stream_loop_send(Priv, CliSock, IdleTimeout) ->
+    stream_loop_send(Priv, CliSock, unflushed, ?unflushed_timeout, IdleTimeout).
+
+stream_loop_send(Priv, CliSock, FlushStatus, CurTimeout, IdleTimeout) ->
     receive
         {streamcontent, Cont} ->
             P = send_streamcontent_chunk(Priv, CliSock, Cont),
-            untimed_stream_loop_send(P, CliSock, FlushTimer) ;
-        {streamcontent_with_ack, From, Cont} ->        % acknowledge after send
+            stream_loop_send(P, CliSock, unflushed,
+                             ?unflushed_timeout, IdleTimeout);
+        {streamcontent_with_ack, From, Cont} -> % acknowledge after send
             P = send_streamcontent_chunk(Priv, CliSock, Cont),
             From ! {self(), streamcontent_ack},
-            untimed_stream_loop_send(P, CliSock, FlushTimer) ;
+            stream_loop_send(P, CliSock, unflushed,
+                             ?unflushed_timeout, IdleTimeout);
         endofstreamcontent ->
-            cancel_t(FlushTimer, flush_timer),
-            end_streaming(Priv, CliSock);
-        timeout_timer  ->
-            cancel_t(FlushTimer, flush_timer),
-            erlang:error(stream_timeout);
-        flush_timer  ->
-            P = sync_streamcontent(Priv, CliSock),
-            untimed_stream_loop_send(P, CliSock, FlushTimer)
-    end.
-
-cancel_t(T, Msg) ->
-    timer:cancel(T),
-    receive
-        Msg -> ok
-    after 0 -> ok
-    end.
-
-stream_loop_send(Priv, CliSock, Timeout,
-                 FlushTimer, TimeoutTimer) ->
-    receive
-        {streamcontent, Cont} ->
-            P = send_streamcontent_chunk(Priv, CliSock, Cont),
-            cancel_t(TimeoutTimer, timeout_timer),
-            {ok, TimeoutTimer2} = timer:send_after(Timeout, timeout_timer),
-            stream_loop_send(P, CliSock, Timeout,
-                             FlushTimer, TimeoutTimer2) ;
-        {streamcontent_with_ack, From, Cont} ->        % acknowledge after send
-            P = send_streamcontent_chunk(Priv, CliSock, Cont),
-            From ! {self(), streamcontent_ack},
-            cancel_t(TimeoutTimer, timeout_timer),
-            {ok, TimeoutTimer2} = timer:send_after(Timeout, timeout_timer),
-            stream_loop_send(P, CliSock, Timeout,
-                             FlushTimer, TimeoutTimer2) ;
-        endofstreamcontent ->
-            cancel_t(TimeoutTimer, timeout_timer),
-            cancel_t(FlushTimer, flush_timer),
-            end_streaming(Priv, CliSock);
-        timeout_timer  ->
-            cancel_t(TimeoutTimer, timeout_timer),
-            cancel_t(FlushTimer, flush_timer),
-            erlang:error(stream_timeout);
-        flush_timer  ->
-            P = sync_streamcontent(Priv, CliSock),
-            stream_loop_send(P, CliSock, Timeout,
-                             FlushTimer, TimeoutTimer)
+            end_streaming(Priv, CliSock)
+    after CurTimeout ->
+            case FlushStatus of
+                flushed ->
+                    erlang:error(stream_timeout);
+                unflushed ->
+                    P = sync_streamcontent(Priv, CliSock),
+                    stream_loop_send(P, CliSock, flushed,
+                                     IdleTimeout, IdleTimeout)
+            end
     end.
 
 make_chunk(Data) ->
@@ -2952,14 +3057,14 @@ wait_for_streamcontent_pid(Priv, CliSock, ContentPid) ->
         discard ->
             ContentPid ! {discard, self()};
         _ ->
-	    SC = get(sc),
-	    case SC#sconf.ssl of
-		undefined ->
-		    gen_tcp:controlling_process(CliSock, ContentPid);
-		_ ->
-		    ssl:controlling_process(CliSock, ContentPid)
-	    end,
-	    ContentPid ! {ok, self()}
+            SC = get(sc),
+            case SC#sconf.ssl of
+                undefined ->
+                    gen_tcp:controlling_process(CliSock, ContentPid);
+                _ ->
+                    ssl:controlling_process(CliSock, ContentPid)
+            end,
+            ContentPid ! {ok, self()}
     end,
     receive
         endofstreamcontent ->
@@ -3056,7 +3161,10 @@ handle_out_reply({yssi, Yfile}, LineNo, YawsFile, UT, ARG) ->
         yaws ->
             Mtime = mtime(UT2#urltype.finfo),
             Key = UT2#urltype.getpath,
-            CliSock = ARG#arg.clisock,
+            CliSock = case yaws_api:get_sslsocket(ARG#arg.clisock) of
+                          {ok, SslSock} -> SslSock;
+                          undefined     -> ARG#arg.clisock
+                      end,
             N = 0,
             case ets:lookup(SC#sconf.ets, Key) of
                 [{_Key, spec, Mtime1, Spec, Es}] when Mtime1 == Mtime,
@@ -3295,7 +3403,8 @@ handle_out_reply({throw, Class, Exc}, LineNo, YawsFile, _UT, ARG) ->
            "File: ~s:~w~n"
            "Class: ~p~nException: ~p~nReq: ~p~n"
            "Stack: ~p~n",
-           [YawsFile, LineNo, Class, Exc, ARG#arg.req, erlang:get_stacktrace()]),
+           [YawsFile, LineNo, Class, Exc, ARG#arg.req,
+            erlang:get_stacktrace()]),
     handle_crash(ARG, L);
 
 handle_out_reply({get_more, Cont, State}, _LineNo, _YawsFile, _UT, _ARG) ->
@@ -3305,10 +3414,15 @@ handle_out_reply(Arg = #arg{},  _LineNo, _YawsFile, _UT, _ARG) ->
     Arg;
 
 handle_out_reply(flush, _LineNo, _YawsFile, _UT, ARG) ->
+    CliSock = case yaws_api:get_sslsocket(ARG#arg.clisock) of
+                  {ok, SslSock} -> SslSock;
+                  undefined     -> ARG#arg.clisock
+              end,
+    Hdrs = ARG#arg.headers,
     CliDataPos0 = get(client_data_pos),
-    CliDataPos1 = flush(ARG#arg.clisock, CliDataPos0,
-                        (ARG#arg.headers)#headers.content_length,
-                        (ARG#arg.headers)#headers.transfer_encoding),
+    CliDataPos1 = flush(CliSock, CliDataPos0,
+                        Hdrs#headers.content_length,
+                        yaws:to_lower(Hdrs#headers.transfer_encoding)),
     put(client_data_pos, CliDataPos1),
     ok;
 
@@ -3484,9 +3598,9 @@ delim_split_file(Del, Data, State, Ack) ->
     case delim_split(Del, Del, Data, [], []) of
         {H, []} when State == data ->
             %% Ok, last chunk
-            lists:reverse([{data, H} | Ack]);
+            lists:reverse([{data, list_to_binary(H)} | Ack]);
         {H, T} when State == data ->
-            delim_split_file(Del, T, var, [{data, H}|Ack]);
+            delim_split_file(Del, T, var, [{data, list_to_binary(H)}|Ack]);
         {H, []} when State == var ->
             lists:reverse([{var, H} | Ack]);
         {H, T} when State == var ->
@@ -3571,13 +3685,14 @@ decide_deflate(true, SC, Arg, Data, decide, Mode) ->
             false;
 
         true ->
-            Mime = yaws:outh_get_content_type(),
-            ?Debug("Check compression support: Mime-Type=~p~n", [Mime]),
-            case compressible_mime_type(Mime, DOpts) of
+            Mime0     = yaws:outh_get_content_type(),
+            [Mime1|_] = yaws:split_sep(Mime0, $;), %% Remove charset
+            ?Debug("Check compression support: Mime-Type=~p~n", [Mime1]),
+            case compressible_mime_type(Mime1, DOpts) of
                 true ->
                     case (Arg =:= undefined
                           orelse
-                          yaws:accepts_gzip(Arg#arg.headers, Mime)) of
+                          yaws:accepts_gzip(Arg#arg.headers, Mime1)) of
                         true when Mode =:= final ->
                             ?Debug("Compress data~n", []),
                             yaws:outh_set_content_encoding(deflate),
@@ -3594,7 +3709,7 @@ decide_deflate(true, SC, Arg, Data, decide, Mode) ->
                             false
                     end;
                 false ->
-                    ?Debug("~p is not compressible~n", [Mime]),
+                    ?Debug("~p is not compressible~n", [Mime1]),
                     yaws:outh_set_content_encoding(identity),
                     false
             end
@@ -3710,14 +3825,14 @@ deflate_accumulated(Arg, Content, ContentLength, Mode) ->
     end.
 
 
-get_more_post_data(PPS, ARG) ->
+get_more_post_data(CliSock, PPS, ARG) ->
     SC = get(sc),
     N = SC#sconf.partial_post_size,
     case (ARG#arg.headers)#headers.content_length of
         undefined ->
-            case (ARG#arg.headers)#headers.transfer_encoding of
+            case yaws:to_lower((ARG#arg.headers)#headers.transfer_encoding) of
                 "chunked" ->
-                    get_chunked_client_data(ARG#arg.clisock, yaws:is_ssl(SC));
+                    get_chunked_client_data(CliSock, yaws:is_ssl(SC));
                 _  ->
                     <<>>
             end;
@@ -3884,7 +3999,7 @@ send_file(CliSock, Path, all, undefined) ->
     send_file(CliSock, Fd, undefined);
 send_file(CliSock, _, all, {gzfile, GzFile}) when is_port(CliSock) ->
     ?Debug("send_file(~p,~p, ...)~n", [CliSock, GzFile]),
-    {ok, Size} = yaws_sendfile:send(CliSock, GzFile),
+    Size = yaws_sendfile:send(CliSock, GzFile),
     yaws_stats:sent(Size);
 send_file(CliSock, _, all, {gzfile, GzFile}) ->
     ?Debug("send_file(~p,~p, ...)~n", [CliSock, GzFile]),
@@ -3944,14 +4059,33 @@ url_type(GetPath, ArgDocroot, VirtualDir) ->
     SC=get(sc),
     GC=get(gc),
     E = SC#sconf.ets,
+
+    %% In reentrant call, the cache can be disabled. It could be useful in case
+    %% of "proxy" appmod.
+    NoCache = case get(is_reentrant_request) of
+                  true ->
+                      case get(page_options) of
+                          undefined -> false;
+                          Opts      ->  proplists:get_bool(disable_cache, Opts)
+                      end;
+                  _ ->
+                      false
+              end,
+
     case ets:lookup(E, {url, GetPath}) of
         [] ->
             UT = do_url_type(SC, GetPath, ArgDocroot, VirtualDir),
             ?TC([{record, UT, urltype}]),
             ?Debug("UT=~s\n", [?format_record(UT, urltype)]),
-            CF = cache_file(SC, GC, GetPath, UT),
-            ?Debug("CF=~s\n", [?format_record(CF, urltype)]),
-            CF;
+            if
+                NoCache ->
+                    ?Debug("Cache disabled\n", []),
+                    UT;
+                true ->
+                    CF = cache_file(SC, GC, GetPath, UT),
+                    ?Debug("CF=~s\n", [?format_record(CF, urltype)]),
+                    CF
+            end;
         [{_, When, UT}] ->
             N = now_secs(),
             Refresh = GC#gconf.cache_refresh_secs,
@@ -4105,11 +4239,10 @@ do_url_type(SC, GetPath, ArgDocroot, VirtualDir) ->
     ?Debug("do_url_type SC=~s~nGetPath=~p~nVirtualDir=~p~n",
            [?format_record(SC,sconf), GetPath,VirtualDir]),
 
-
     case GetPath of
         _ when ?sc_has_dav(SC) ->
             {Comps, RevFile} = comp_split(GetPath),
-            {_Type, _, Mime} = suffix_type(RevFile),
+            {_Type, Mime} = suffix_type(SC, RevFile),
 
             FullPath = construct_fullpath(ArgDocroot, GetPath, VirtualDir),
 
@@ -4127,6 +4260,12 @@ do_url_type(SC, GetPath, ArgDocroot, VirtualDir) ->
         "/" -> %% special case
             case lists:keysearch("/", 1, SC#sconf.appmods) of
                 {value, AppmodDef} ->
+                    %% Remove appmod for this request to avoid an infinte loop
+                    %% in case of a reentrant call
+                    put(sc, SC#sconf{appmods=lists:delete(
+                                               AppmodDef, SC#sconf.appmods
+                                              )}),
+
                     %% AppmodDef can be either a 2-tuple or 3-tuple depending
                     %% on whether there are exclude paths present. We want
                     %% only the second element of the tuple in either case.
@@ -4182,6 +4321,12 @@ do_url_type(SC, GetPath, ArgDocroot, VirtualDir) ->
                                                    ArgDocroot, VirtualDir)
                     end;
                 {ok, {Mount, Mod}} ->
+                    %% Remove appmod for this request to avoid an infinte loop
+                    %% in case of a reentrant call
+                    put(sc, SC#sconf{appmods=lists:keydelete(
+                                               Mount, 1, SC#sconf.appmods
+                                              )}),
+
                     %%active_appmod found the most specific appmod for this
                     %% request path
                     %% - now we need to determine the prepath & path_info
@@ -4267,7 +4412,8 @@ do_url_type(SC, GetPath, ArgDocroot, VirtualDir) ->
 %% return {Comps, RevPart} where Comps is a (possibly empty) list of path
 %% components - always with trailing "/"
 %% revPart is the final segment in reverse and has no "/".
-%% e.g split( "/test/etc/index.html",[],[]) -> {["/test/", "etc/"], "lmth.xedni"}
+%% e.g split( "/test/etc/index.html",[],[]) ->
+%%     {["/test/", "etc/"], "lmth.xedni"}
 %% revPart is useful in this form for looking up the file extension's mime-type.
 %%
 %% Terminology note to devs: reserve the word 'comp' to refer to a single
@@ -4469,13 +4615,14 @@ maybe_return_dir(DR, GetPath,VirtualDir) ->
 
 maybe_return_path_info(SC, Comps, RevFile, DR, VirtualDir) ->
 
-    case path_info_split(Comps, {DR, VirtualDir}) of
+    case path_info_split(SC, Comps, {DR, VirtualDir}) of
         {not_a_script, error} ->
             %%can we use urltype.data to return more info?
             %% - logging?
             #urltype{type=error};
         {ok, FI, FullPath, HeadComps, File, TrailComps, Type, Mime} ->
-            %%'File' is the only comp that has been returned without trailing "/"
+            %%'File' is the only comp that has been returned
+            %% without trailing "/"
 
             {Type2, Mime2} =
                 case member(Type, SC#sconf.allowed_scripts) of
@@ -4513,7 +4660,8 @@ maybe_return_path_info(SC, Comps, RevFile, DR, VirtualDir) ->
     end.
 
 
-%%scan a list of 'comps' of form "pathsegment/"   (trailing slash always present)
+%%scan a list of 'comps' of form "pathsegment/"
+%% (trailing slash always present)
 %% - looking for the rightmost dotted component that corresponds to a script
 %% file.
 
@@ -4529,21 +4677,21 @@ maybe_return_path_info(SC, Comps, RevFile, DR, VirtualDir) ->
 %% point', otherwise the Docroot that has been determined based on the full
 %%  request path becomes invalid!
 %%
-path_info_split(Comps,DR_Vdir) ->
-    path_info_split(lists:reverse(Comps), DR_Vdir, []).
+path_info_split(SC, Comps,DR_Vdir) ->
+    path_info_split(SC, lists:reverse(Comps), DR_Vdir, []).
 
-path_info_split([H|T], {DR, VirtualDir}, AccPathInfo) ->
+path_info_split(SC, [H|T], {DR, VirtualDir}, AccPathInfo) ->
     [$/|RevPath] = lists:reverse(H),
     case suffix_from_rev(RevPath) of
         [] ->   % shortcut clause, not necessary
-            path_info_split(T, {DR, VirtualDir}, [H|AccPathInfo]);
+            path_info_split(SC, T, {DR, VirtualDir}, [H|AccPathInfo]);
         Suff ->
-            {Type, Mime} = mime_types:t(Suff),
+            {Type, Mime} = mime_types:t(SC, Suff),
             case Type of
                 regular ->
                     %%Don't hit the filesystem to test components that
                     %%'mime_types' indicates can't possibly be scripts
-                    path_info_split(T, {DR, VirtualDir}, [H|AccPathInfo]);
+                    path_info_split(SC, T, {DR, VirtualDir}, [H|AccPathInfo]);
                 X ->
 
                     %%We may still be in the 'PATH_INFO' section
@@ -4564,11 +4712,12 @@ path_info_split([H|T], {DR, VirtualDir}, AccPathInfo) ->
                             {not_a_script, error};
                         _Err ->
                             %%just looked like a script - keep going.
-                            path_info_split(T, {DR, VirtualDir}, [H|AccPathInfo])
+                            path_info_split(SC, T, {DR, VirtualDir},
+                                            [H|AccPathInfo])
                     end
             end
     end;
-path_info_split([], _DR_Vdir, _Acc) ->
+path_info_split(_SC, [], _DR_Vdir, _Acc) ->
     {not_a_script, error}.
 
 
@@ -4586,7 +4735,8 @@ suffix_from_rev([], _A) ->
 %% - single-level concatenatenation of a list of path components which
 %% already contain slashes.
 %% tests suggest it's significantly faster than lists:flatten or lists:concat
-%% & marginally faster than lists:append (for paths of 3 or more segments anyway)
+%% & marginally faster than lists:append
+%% (for paths of 3 or more segments anyway)
 %% tested with various fairly short path lists - see src/benchmarks folder
 %%
 
@@ -4598,7 +4748,8 @@ conc_path([H|T]) ->
 
 %% tail-recursive version slower for longer paths according to bench.erl
 %% (mainly because we need to do 'Acc ++ H' rather than 'H ++ Acc')
-%% Tail recursion not very useful here anyway as we're dealing with short strings.
+%% Tail recursion not very useful here anyway as we're
+%% dealing with short strings.
 %%conc_path2([]) ->
 %%        [];
 %%conc_path2([H|T]) ->
@@ -4635,13 +4786,15 @@ ret_user_dir(Upath)  ->
                         Home ->
                             DR2 = Home ++ "/public_html/",
                             SC2 = SC#sconf{
-                                    allowed_scripts = SC#sconf.tilde_allowed_scripts,
+                                    allowed_scripts =
+                                        SC#sconf.tilde_allowed_scripts,
                                     docroot=DR2},
                             put(sc, SC2),
 
                             %% !todo - review interactions between Virtual
                             %% Dirs & Home Dir paths.
-                            %% VirtualDir hardcoded empty is not nice behaviour -
+                            %% VirtualDir hardcoded empty is not
+                            %% nice behaviour -
                             %% a rewrite mod author may reasonably expect to
                             %% be able to have influence here.
 
@@ -4678,8 +4831,9 @@ parse_user_path(DR, [H|T], User) ->
     parse_user_path(DR, T, [H|User]).
 
 
-deflate_q(true, SC, regular, Mime) ->
-    case compressible_mime_type(Mime, SC#sconf.deflate_options) of
+deflate_q(true, SC, regular, Mime0) ->
+    [Mime1|_] = yaws:split_sep(Mime0, $;), %% Remove charset
+    case compressible_mime_type(Mime1, SC#sconf.deflate_options) of
         true -> dynamic;
         false -> undefined
     end;
@@ -4688,21 +4842,15 @@ deflate_q(_, _, _, _) ->
 
 
 suffix_type(SC, L) ->
-    R=suffix_type(L),
-    case R of
+    case mime_types:revt(SC, yaws:upto_char($., L)) of
         {regular, _Ext, Mime} ->
             {regular, Mime};
         {X, _Ext, Mime} ->
             case member(X, SC#sconf.allowed_scripts) of
-                true -> {X, Mime};
-                false -> {regular, "text/plain"}
+                true  -> {X, Mime};
+                false -> {regular, mime_types:default_type(SC)}
             end
     end.
-
-suffix_type(L) ->
-    L2 = yaws:upto_char($., L),
-    mime_types:revt(L2).
-
 
 
 compressible_mime_type(Mime, #deflate{mime_types=MimeTypes}) ->
@@ -4920,7 +5068,7 @@ close_accepted_if_max(GS,{ok, Socket}) ->
     NumCon = GS#gs.connections,
     if
         NumCon < MaxCon ->
-	    ok;
+            ok;
         true ->
             S=case peername(Socket, GS#gs.ssl) of
                   {unknown, unknown} ->
@@ -4930,7 +5078,11 @@ close_accepted_if_max(GS,{ok, Socket}) ->
               end,
             error_logger:format(
               "Max connections reached - closing conn to ~s~n",[S]),
-	    gen_tcp:close(Socket)
+            if
+                GS#gs.ssl == nossl -> gen_tcp:close(Socket);
+                GS#gs.ssl == ssl   -> ssl:close(Socket)
+            end
+
     end;
 close_accepted_if_max(_,_) ->
     ok.
