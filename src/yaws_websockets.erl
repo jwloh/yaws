@@ -45,7 +45,8 @@
                  open_fun,
                  msg_fun_1,
                  msg_fun_2,
-                 info_fun}).
+                 info_fun,
+		 call_fun}).
 
 -export([start/3, send/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -189,8 +190,8 @@ init([Arg, CbMod, Opts]) ->
 
 %% ----
 %% Skip all sync requests
-handle_call(_Req, _From, State) ->
-    {reply, ok, State, State#state.timeout}.
+handle_call(Req, From, State) ->
+    handle_callback(call, [State, Req, From]).
 
 
 %% ----
@@ -306,7 +307,7 @@ handle_info(timeout, #state{wait_pong_frame=true}=State) ->
     State1 = State#state{wait_pong_frame=false},
     case get_opts(drop_on_timeout, State1#state.opts) of
         true  -> handle_abnormal_closure(State1);
-        false -> handle_callback_info(timeout, State1)
+        false -> handle_callback(info, [timeout, State1])
     end;
 
 %% Close timeout: just shutdown the gen_server
@@ -319,7 +320,7 @@ handle_info(close, State) ->
 
 %% All other messages
 handle_info(Info, State) ->
-    handle_callback_info(Info, State).
+    handle_callback(info, [State, Info]).
 
 
 %% ----
@@ -382,13 +383,18 @@ get_callback_info(Mod) ->
                           true  -> handle_info;
                           false -> undefined
                       end,
+	    CallFun = case erlang:function_exported(Mod, handle_call, 3) of
+			  true -> handle_call;
+			  false -> undefined
+		      end,
             {ok, #cbinfo{module        = Mod,
                          init_fun      = InitFun,
                          terminate_fun = TerminateFun,
                          open_fun      = OpenFun,
                          msg_fun_1     = MsgFun1,
                          msg_fun_2     = MsgFun2,
-                         info_fun      = InfoFun}};
+                         info_fun      = InfoFun,
+			 call_fun      = CallFun}};
         {error, Reason} ->
             error_logger:error_msg("Cannot load callback module '~p': ~p",
                                    [Mod, Reason]),
@@ -532,14 +538,18 @@ handle_frames(FirstPacket, #state{wsstate=WSState, opts=Opts}=State) ->
     end.
 
 
-handle_callback_info(Info, #state{cbinfo=CbInfo}=State) ->
-    case CbInfo#cbinfo.info_fun of
+handle_callback(Type, [#state{cbinfo=CbInfo}=State | Args]) ->
+    Cb = case Type of
+	info -> CbInfo#cbinfo.info_fun;
+	call -> CbInfo#cbinfo.call_fun
+    end,
+    case Cb of
         undefined ->
             {noreply, State, State#state.timeout};
-        InfoFun ->
+        CbFun ->
             {_, CbState} = State#state.cbstate,
             CbMod = CbInfo#cbinfo.module,
-            Res   = CbMod:InfoFun(Info, CbState),
+            Res   = erlang:apply(CbMod, CbFun, Args ++ [CbState]),
             case handle_callback_result(Res, State) of
                 {ok, State1, Timeout} -> {noreply, State1, Timeout};
                 {stop, State1}        -> {stop, normal, State1}
