@@ -1234,7 +1234,7 @@ aloop(CliSock, {IP,Port}=IPPort, GS, Num) ->
 				   deliver_xxx(CliSock, Req, Status, Msg)
 			   end,
 		    Call2 = fix_keepalive_maxuses(Call),
-		    handle_method_result(Call2, CliSock, {PeerIP,PeerPort}, GS, Req, H, Num);
+		    handle_method_result(Call2, CliSock, {PeerIP,PeerPort}, GS, Req, H, Num)
             end;
         closed ->
             case yaws_trace:get_type(GS#gs.gconf) of
